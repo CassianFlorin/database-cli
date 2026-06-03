@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+DB_QUERY = SKILL_ROOT / "scripts" / "db-query"
+SERVER_VERSION = "0.2.0"
+
+
+def tool_schema():
+    common_config = {
+        "type": "string",
+        "description": "Optional path to database-cli connections JSON.",
+    }
+    env = {"type": "string", "description": "Configured database-cli environment name."}
+    return [
+        {
+            "name": "list_envs",
+            "description": "List configured database-cli environments.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"config": common_config},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "query_readonly",
+            "description": "Run a safe read-only SQL statement through database-cli.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "env": env,
+                    "sql": {"type": "string", "description": "Read-only SQL statement."},
+                    "schema": {"type": "string", "description": "Optional schema/catalog override."},
+                    "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
+                    "limit": {"type": "integer", "minimum": 0},
+                    "no_auto_limit": {"type": "boolean"},
+                },
+                "required": ["env", "sql"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "inspect",
+            "description": "Inspect a database source or one table through database-cli.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "env": env,
+                    "target": {"type": "string", "description": "Optional table/source target."},
+                    "schema": {"type": "string", "description": "Optional schema/catalog override."},
+                    "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
+                },
+                "required": ["env"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "search_objects",
+            "description": "Search schema/table/column/index metadata with a SQL LIKE pattern.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "env": env,
+                    "pattern": {"type": "string", "description": "SQL LIKE pattern, e.g. %order_no%."},
+                    "object_type": {"type": "string", "enum": ["schema", "table", "column", "index"]},
+                    "schema": {"type": "string", "description": "Optional schema/database filter."},
+                    "table": {"type": "string", "description": "Optional table filter for column/index search."},
+                    "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
+                    "limit": {"type": "integer", "minimum": 0},
+                },
+                "required": ["env", "pattern"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "check_sql",
+            "description": "Validate database-cli read-only SQL safety without executing it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "SQL statement to validate."},
+                    "limit": {"type": "integer", "minimum": 0},
+                    "no_auto_limit": {"type": "boolean"},
+                },
+                "required": ["sql"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def add_common_args(cmd, args):
+    if args.get("config"):
+        cmd.extend(["--config", args["config"]])
+    if args.get("format"):
+        cmd.extend(["--format", args["format"]])
+    if args.get("limit") is not None:
+        cmd.extend(["--limit", str(args["limit"])])
+    if args.get("schema"):
+        cmd.extend(["--schema", args["schema"]])
+    if args.get("no_auto_limit"):
+        cmd.append("--no-auto-limit")
+
+
+def command_for_tool(name, args):
+    cmd = [str(DB_QUERY)]
+    if name == "list_envs":
+        if args.get("config"):
+            cmd.extend(["--config", args["config"]])
+        cmd.append("--list-envs")
+        return cmd
+    if name == "query_readonly":
+        add_common_args(cmd, args)
+        cmd.extend(["--env", args["env"], "--sql", args["sql"]])
+        return cmd
+    if name == "inspect":
+        add_common_args(cmd, args)
+        cmd.extend(["--env", args["env"], "--inspect"])
+        if args.get("target"):
+            cmd.append(args["target"])
+        return cmd
+    if name == "search_objects":
+        add_common_args(cmd, args)
+        cmd.extend(["--env", args["env"], "--search-objects", args["pattern"]])
+        if args.get("object_type"):
+            cmd.extend(["--object-type", args["object_type"]])
+        if args.get("table"):
+            cmd.extend(["--table", args["table"]])
+        return cmd
+    if name == "check_sql":
+        if args.get("limit") is not None:
+            cmd.extend(["--limit", str(args["limit"])])
+        if args.get("no_auto_limit"):
+            cmd.append("--no-auto-limit")
+        cmd.extend(["--check-sql", args["sql"]])
+        return cmd
+    raise ValueError(f"Unknown tool '{name}'.")
+
+
+def run_tool(name, args):
+    cmd = command_for_tool(name, args)
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    text = proc.stdout
+    if proc.stderr:
+        text = text + ("\n" if text else "") + proc.stderr
+    return {
+        "content": [{"type": "text", "text": text.strip()}],
+        "isError": proc.returncode != 0,
+    }
+
+
+def error_response(message, code=-32603):
+    return {"jsonrpc": "2.0", "error": {"code": code, "message": message}}
+
+
+def handle(message):
+    method = message.get("method")
+    response = {"jsonrpc": "2.0"}
+    if "id" in message:
+        response["id"] = message["id"]
+
+    try:
+        if method == "initialize":
+            response["result"] = {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "database-cli", "version": SERVER_VERSION},
+            }
+        elif method == "tools/list":
+            response["result"] = {"tools": tool_schema()}
+        elif method == "tools/call":
+            params = message.get("params") or {}
+            response["result"] = run_tool(params["name"], params.get("arguments") or {})
+        elif method and method.startswith("notifications/"):
+            return None
+        else:
+            response["error"] = {"code": -32601, "message": f"Unknown method '{method}'."}
+    except KeyError as exc:
+        response["error"] = {"code": -32602, "message": f"Missing required field: {exc}"}
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        response["error"] = {"code": -32603, "message": str(exc)}
+    return response
+
+
+def parse_content_length_frames(data):
+    messages = []
+    offset = 0
+    while offset < len(data):
+        header_end = data.find(b"\r\n\r\n", offset)
+        if header_end == -1:
+            break
+        headers = data[offset:header_end].decode("ascii", errors="replace").split("\r\n")
+        length = None
+        for header in headers:
+            name, _, value = header.partition(":")
+            if name.lower() == "content-length":
+                length = int(value.strip())
+        if length is None:
+            break
+        start = header_end + 4
+        end = start + length
+        messages.append(json.loads(data[start:end].decode("utf-8")))
+        offset = end
+    return messages
+
+
+def read_messages(data):
+    if data.lstrip().startswith(b"Content-Length:"):
+        return parse_content_length_frames(data), True
+    messages = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+    return messages, False
+
+
+def write_response(response, framed):
+    raw = json.dumps(response, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if framed:
+        sys.stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii"))
+        sys.stdout.buffer.write(raw)
+    else:
+        sys.stdout.write(raw.decode("utf-8") + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    data = sys.stdin.buffer.read()
+    if not data:
+        return 0
+    try:
+        messages, framed = read_messages(data)
+    except (ValueError, json.JSONDecodeError) as exc:
+        write_response(error_response(f"Invalid JSON-RPC input: {exc}", -32700), False)
+        return 0
+    for message in messages:
+        response = handle(message)
+        if response is not None and "id" in response:
+            write_response(response, framed)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

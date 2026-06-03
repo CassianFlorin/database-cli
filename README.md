@@ -1,16 +1,18 @@
 # Database CLI Plugin
 
-这是一个 Codex Plugin，内置 `database-cli` Skill。它面向数据库问题排查：查看表结构、执行有范围的只读 SQL、跨环境核对记录，以及在需要修数时产出给人工执行的 SQL。
+这是一个 Codex Plugin，内置 `database-cli` Skill。它面向数据库问题排查：查看表结构、搜索 schema/table/column/index、执行有范围的只读 SQL、跨环境核对记录，以及在需要修数时产出给人工执行的 SQL。
 
-底层使用 [`sq`](https://sq.io/) 作为数据库 CLI 后端，并通过本项目的 wrapper 做安全限制。
+底层使用 [`sq`](https://sq.io/) 作为数据库 CLI 后端，并通过本项目的 wrapper 做安全限制。Agent 可以直接使用本项目提供的 CLI 或 stdio MCP server，不需要再安装 DBHub 这类额外数据库 MCP 工具。
 
 ## 能力范围
 
 - 通过 `scripts/db-query` 执行只读 SQL。
+- 通过 `scripts/database-mcp` 暴露 stdio MCP 工具：`list_envs`、`query_readonly`、`inspect`、`search_objects`、`check_sql`。
 - 通过本地 `connections.local.json` 保存连接配置。
 - 按环境名管理连接，例如 `qa01`、`prod`，让 Agent 和开发者使用同一套入口。
 - 默认按数据库实例/服务端连接，不把配置限制到某个 database/schema。
 - 支持只配置域名，不配置端口；适用于域名或反向代理已处理端口的场景。
+- 支持 DBHub 风格对象搜索：schema、table、column、index metadata。
 - 拦截常见写入、DDL、权限、事务、过程、锁、导出和副作用 SQL。
 - 避免把密码写入命令行 DSN；本地密钥文件不提交到仓库。
 
@@ -30,10 +32,12 @@
 │       │   ├── config.example.json
 │       │   └── config.md
 │       └── scripts/
+│           ├── database-mcp
 │           ├── db-query
 │           ├── install
 │           └── init-config
 └── scripts/
+    ├── database-mcp
     ├── db-query
     ├── install
     └── init-config
@@ -76,6 +80,41 @@ scripts/db-query --env qa01 --sql "SELECT 1"
 ```bash
 scripts/db-query --env qa01 --sql "SELECT id FROM qnvip_center_commerce.cc_order WHERE order_no = 'YP...'"
 ```
+
+## DBHub 风格对象搜索
+
+如果只知道表名、字段名或索引名的一部分，可以直接查 metadata，不必先手写 information_schema SQL：
+
+```bash
+scripts/db-query --env qa01 --search-objects "%cc_order%" --object-type table
+scripts/db-query --env qa01 --search-objects "%order_no%" --object-type column --table cc_order
+scripts/db-query --env qa01 --search-objects "%idx_order%" --object-type index --table cc_order
+```
+
+当前对象搜索支持 MySQL/MariaDB/Postgres 直连配置。其他数据库或高级 `sq source` 配置仍可使用：
+
+```bash
+scripts/db-query --env qa01 --inspect
+scripts/db-query --env qa01 --inspect cc_order
+```
+
+## MCP Server
+
+`scripts/database-mcp` 是一个无额外 Python 依赖的 stdio MCP server，工具层复用 `scripts/db-query` 的只读校验和连接配置。它提供：
+
+- `list_envs`：列出当前配置的环境。
+- `query_readonly`：执行只读 SQL。
+- `inspect`：查看 source 或表结构。
+- `search_objects`：搜索 schema/table/column/index metadata。
+- `check_sql`：只校验 SQL 安全性，不执行。
+
+MCP 客户端可以把 command 指到插件根目录下的入口：
+
+```bash
+/Users/huapai/OpenSourceProject/database-cli/scripts/database-mcp
+```
+
+也可以在安装到任意目录后使用对应的绝对路径。连接配置仍由 `connections.local.json` 或 `DATABASE_CLI_CONFIG` 控制。
 
 ## 通过 Agent 安装和修改配置
 

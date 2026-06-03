@@ -212,6 +212,116 @@ def maybe_add_limit(sql, token, limit, limit_style, no_auto_limit):
     return f"{sql.strip().rstrip(';')} LIMIT {limit}"
 
 
+def sql_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def append_filter(clauses, column, value, operator="="):
+    if value:
+        clauses.append(f"{column} {operator} {sql_literal(value)}")
+
+
+def where_clause(clauses):
+    return " WHERE " + " AND ".join(clauses) if clauses else ""
+
+
+def build_search_objects_sql(env, args):
+    driver = env_value(env, "driver", "type").lower()
+    if driver not in {"mysql", "mariadb", "postgres", "postgresql"}:
+        raise ConfigError(
+            "Object search currently supports mysql/mariadb/postgres/postgresql direct configs. "
+            "Use --inspect for other drivers or configured sq source handles."
+        )
+
+    object_type = args.object_type
+    pattern = args.search_objects
+    schema_filter = args.schema
+    table_filter = args.table
+
+    if driver in {"mysql", "mariadb"}:
+        if object_type == "schema":
+            clauses = [f"SCHEMA_NAME LIKE {sql_literal(pattern)}"]
+            return (
+                "SELECT SCHEMA_NAME AS schema_name "
+                "FROM INFORMATION_SCHEMA.SCHEMATA"
+                f"{where_clause(clauses)} "
+                "ORDER BY SCHEMA_NAME"
+            )
+        if object_type == "table":
+            clauses = [f"TABLE_NAME LIKE {sql_literal(pattern)}"]
+            append_filter(clauses, "TABLE_SCHEMA", schema_filter)
+            return (
+                "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, TABLE_TYPE AS table_type "
+                "FROM INFORMATION_SCHEMA.TABLES"
+                f"{where_clause(clauses)} "
+                "ORDER BY TABLE_SCHEMA, TABLE_NAME"
+            )
+        if object_type == "column":
+            clauses = [f"COLUMN_NAME LIKE {sql_literal(pattern)}"]
+            append_filter(clauses, "TABLE_SCHEMA", schema_filter)
+            append_filter(clauses, "TABLE_NAME", table_filter)
+            return (
+                "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name, "
+                "DATA_TYPE AS data_type, COLUMN_TYPE AS column_type, IS_NULLABLE AS is_nullable, "
+                "COLUMN_KEY AS column_key, COLUMN_COMMENT AS column_comment "
+                "FROM INFORMATION_SCHEMA.COLUMNS"
+                f"{where_clause(clauses)} "
+                "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+            )
+        if object_type == "index":
+            clauses = [f"INDEX_NAME LIKE {sql_literal(pattern)}"]
+            append_filter(clauses, "TABLE_SCHEMA", schema_filter)
+            append_filter(clauses, "TABLE_NAME", table_filter)
+            return (
+                "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, INDEX_NAME AS index_name, "
+                "COLUMN_NAME AS column_name, NON_UNIQUE AS non_unique, SEQ_IN_INDEX AS seq_in_index "
+                "FROM INFORMATION_SCHEMA.STATISTICS"
+                f"{where_clause(clauses)} "
+                "ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+            )
+
+    if object_type == "schema":
+        clauses = [f"schema_name LIKE {sql_literal(pattern)}"]
+        return (
+            "SELECT schema_name "
+            "FROM information_schema.schemata"
+            f"{where_clause(clauses)} "
+            "ORDER BY schema_name"
+        )
+    if object_type == "table":
+        clauses = [f"table_name LIKE {sql_literal(pattern)}"]
+        append_filter(clauses, "table_schema", schema_filter)
+        return (
+            "SELECT table_schema, table_name, table_type "
+            "FROM information_schema.tables"
+            f"{where_clause(clauses)} "
+            "ORDER BY table_schema, table_name"
+        )
+    if object_type == "column":
+        clauses = [f"column_name LIKE {sql_literal(pattern)}"]
+        append_filter(clauses, "table_schema", schema_filter)
+        append_filter(clauses, "table_name", table_filter)
+        return (
+            "SELECT table_schema, table_name, column_name, data_type, is_nullable "
+            "FROM information_schema.columns"
+            f"{where_clause(clauses)} "
+            "ORDER BY table_schema, table_name, ordinal_position"
+        )
+    if object_type == "index":
+        clauses = [f"indexname LIKE {sql_literal(pattern)}"]
+        append_filter(clauses, "schemaname", schema_filter)
+        append_filter(clauses, "tablename", table_filter)
+        return (
+            "SELECT schemaname AS table_schema, tablename AS table_name, indexname AS index_name, "
+            "indexdef AS index_definition "
+            "FROM pg_catalog.pg_indexes"
+            f"{where_clause(clauses)} "
+            "ORDER BY schemaname, tablename, indexname"
+        )
+
+    raise ConfigError(f"Unsupported object type '{object_type}'.")
+
+
 def config_paths(explicit_path):
     if explicit_path:
         return [Path(explicit_path).expanduser()]
@@ -572,6 +682,9 @@ def parse_args():
     parser.add_argument("--sql", help="Read-only SQL statement to execute.")
     parser.add_argument("--check-sql", help="Validate SQL safety without executing.")
     parser.add_argument("--inspect", nargs="?", const="", help="Inspect a source or table.")
+    parser.add_argument("--search-objects", help="Search schema/table/column/index metadata with a SQL LIKE pattern.")
+    parser.add_argument("--object-type", choices=["schema", "table", "column", "index"], default="table")
+    parser.add_argument("--table", help="Limit column/index metadata search to one table.")
     parser.add_argument("--list-envs", action="store_true", help="List configured environments.")
     parser.add_argument("--format", choices=["json", "csv", "markdown", "text", "yaml"], default="json")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Default row limit for SELECT/WITH queries.")
@@ -615,11 +728,23 @@ def main():
             )
             source, sq_config, setup = prepare_source(args, config, env, args.env)
             cmd = build_sql_command(args, config, env, sql, source, sq_config)
+        elif args.search_objects:
+            search_sql = build_search_objects_sql(env, args)
+            _, token = validate_sql(search_sql)
+            sql = maybe_add_limit(
+                search_sql,
+                token,
+                args.limit,
+                env.get("limit_style", "limit"),
+                args.no_auto_limit,
+            )
+            source, sq_config, setup = prepare_source(args, config, env, args.env)
+            cmd = build_sql_command(args, config, env, sql, source, sq_config)
         elif args.inspect is not None:
             source, sq_config, setup = prepare_source(args, config, env, args.env)
             cmd = build_inspect_command(args, config, env, source, sq_config)
         else:
-            raise ConfigError("Provide --sql, --inspect, --list-envs, or --check-sql.")
+            raise ConfigError("Provide --sql, --search-objects, --inspect, --list-envs, or --check-sql.")
 
         if args.print_command:
             if isinstance(setup, tuple):

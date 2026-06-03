@@ -4,7 +4,7 @@
 
 ## 目标
 
-把 `database-cli` 安装后配置好，使 Agent 可以通过本地 CLI 执行只读数据库查询。
+把 `database-cli` 安装后配置好，使 Agent 可以通过本地 CLI 或 stdio MCP server 执行只读数据库查询。
 
 ## 步骤
 
@@ -54,7 +54,13 @@ scripts/db-query --env qa01 --sql "SELECT 1"
 
 如果只有生产环境可用，只能在用户明确同意后执行 `SELECT 1`。
 
-8. 不要猜测数据库地址、用户名、密码或访问范围。用户未提供时，停止并询问。
+8. 验证 MCP 入口可启动：
+
+```bash
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | scripts/database-mcp
+```
+
+9. 不要猜测数据库地址、用户名、密码或访问范围。用户未提供时，停止并询问。
 
 ## 非交互式示例
 
@@ -78,6 +84,7 @@ scripts/db-query --list-envs
 ## 安全边界
 
 - 只允许通过 `scripts/db-query` 查询。
+- 需要 Agent 结构化工具入口时，使用 `scripts/database-mcp`；它仍然委托 `scripts/db-query` 执行实际查询。
 - 不执行写 SQL。
 - 修数时只输出给人工执行的 SQL。
 - 不展示或提交明文密码。

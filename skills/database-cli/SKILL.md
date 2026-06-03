@@ -1,11 +1,11 @@
 ---
 name: database-cli
-description: "Use when Codex needs to inspect database schema, run safe read-only SQL, compare records across environments, or produce human-reviewed repair SQL through a local command-line workflow. This skill uses local database CLI tools, primarily sq, and enforces read-only safety: never mutate database data directly; output repair SQL for humans to execute when changes are required."
+description: "Use when Codex needs to inspect database schema, search schema/table/column/index metadata, run safe read-only SQL, compare records across environments, or produce human-reviewed repair SQL through a local command-line or MCP workflow. This skill uses database-cli wrappers over local database tools and enforces read-only safety: never mutate database data directly; output repair SQL for humans to execute when changes are required."
 ---
 
 # Database CLI
 
-Use this skill for database-backed investigation through local CLI tools. Treat it as a read-only evidence tool. When invoked from the plugin root, the root `scripts/*` wrappers delegate to this skill's scripts. When installed directly under `~/.codex/skills/database-cli`, run scripts from that skill directory.
+Use this skill for database-backed investigation through local CLI tools or the bundled stdio MCP server. Treat it as a read-only evidence tool. When invoked from the plugin root, the root `scripts/*` wrappers delegate to this skill's scripts. When installed directly under `~/.codex/skills/database-cli`, run scripts from that skill directory.
 
 ## Hard Rules
 
@@ -15,6 +15,7 @@ Use this skill for database-backed investigation through local CLI tools. Treat 
 - Refuse SQL containing mutation, DDL, permission, transaction, procedure, lock, export, or side-effect keywords.
 - Keep queries scoped with exact business keys, selected columns, and a bounded result set.
 - Use `scripts/db-query` rather than calling `sq` directly. The wrapper enforces read-only SQL checks and consistent output.
+- If an Agent needs DBHub-like structured tools, use `scripts/database-mcp`; it delegates to `scripts/db-query` and preserves the same safety boundary.
 - If data must be repaired, output SQL for a human to execute. Include target environment, pre-check SQL, change SQL, post-check SQL, and rollback or recovery notes.
 
 ## Setup Check
@@ -66,13 +67,31 @@ scripts/db-query --env qa01 --inspect
 scripts/db-query --env qa01 --inspect table_name
 ```
 
-4. For data lookup, run a bounded read-only query:
+4. For DBHub-style object search, use metadata search:
+
+```bash
+scripts/db-query --env qa01 --search-objects "%cc_order%" --object-type table
+scripts/db-query --env qa01 --search-objects "%order_no%" --object-type column --table cc_order
+scripts/db-query --env qa01 --search-objects "%idx_order%" --object-type index --table cc_order
+```
+
+5. For data lookup, run a bounded read-only query:
 
 ```bash
 scripts/db-query --env qa01 --sql "SELECT id, order_no, status FROM dbname.schema_or_table WHERE order_no = 'YP...'"
 ```
 
-5. Summarize only the fields needed to answer the user. Avoid spreading unrelated sensitive data.
+6. Summarize only the fields needed to answer the user. Avoid spreading unrelated sensitive data.
+
+## MCP Workflow
+
+When a client supports custom MCP servers, point it at:
+
+```bash
+scripts/database-mcp
+```
+
+The server exposes `list_envs`, `query_readonly`, `inspect`, `search_objects`, and `check_sql`. Use it when you want Agent-native structured calls without installing DBHub.
 
 ## Useful Commands
 
@@ -92,6 +111,12 @@ Choose a non-default output format:
 
 ```bash
 scripts/db-query --env qa01 --format markdown --sql "SHOW TABLES"
+```
+
+Search table, column, or index metadata:
+
+```bash
+scripts/db-query --env qa01 --search-objects "%order_no%" --object-type column --table cc_order
 ```
 
 Use a specific config file:
