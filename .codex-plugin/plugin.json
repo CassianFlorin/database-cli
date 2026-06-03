@@ -1,7 +1,7 @@
 {
   "name": "database-cli",
   "version": "0.1.0",
-  "description": "Read-only database investigation through local CLI tools, replacing DBHub MCP lookups with sq-backed commands.",
+  "description": "Read-only database investigation through local sq-backed CLI commands.",
   "author": {
     "name": "Cassian Florin",
     "url": "https://github.com/CassianFlorin"
@@ -14,7 +14,7 @@
     "sql",
     "cli",
     "sq",
-    "dbhub",
+    "query",
     "read-only"
   ],
   "skills": "./skills/",

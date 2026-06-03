@@ -3,3 +3,5 @@ connections.local.json
 .DS_Store
 *.log
 __pycache__/
+.codegraph/
+.cursor/

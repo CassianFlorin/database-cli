@@ -40,18 +40,6 @@ scripts/install
 - 用户名
 - 密码或密码环境变量
 
-如果用户提供已有 DBHub TOML 路径，可以优先迁移，不必逐项询问：
-
-```bash
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --force
-```
-
-只迁移某一个环境：
-
-```bash
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --env qa01 --force
-```
-
 6. 生成配置后验证：
 
 ```bash
@@ -86,18 +74,6 @@ scripts/init-config \
 ```bash
 scripts/db-query --list-envs
 ```
-
-## DBHub TOML 迁移示例
-
-```bash
-scripts/init-config \
-  --from-dbhub-toml /Users/huapai/docker_data/dbhub_docker/dbhub.toml \
-  --force
-scripts/db-query --list-envs
-scripts/db-query --env qnvip-qa-01 --sql "SELECT 1"
-```
-
-不要把 TOML、DSN 或生成的 `connections.local.json` 内容输出给用户；只汇报环境名和验证结果。
 
 ## 安全边界
 

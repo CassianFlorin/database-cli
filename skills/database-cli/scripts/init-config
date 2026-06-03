@@ -5,12 +5,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlparse
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
-    tomllib = None
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -44,77 +38,6 @@ def load_existing(path):
         data = json.load(handle)
     data.setdefault("environments", {})
     return data
-
-
-def load_toml(path):
-    if tomllib is None:
-        raise ValueError("Python tomllib is unavailable; use Python 3.11+ or install tomli")
-    with path.open("rb") as handle:
-        return tomllib.load(handle)
-
-
-def env_from_dsn(dsn):
-    parsed = urlparse(dsn)
-    driver = parsed.scheme.lower()
-    if driver == "postgresql":
-        driver = "postgres"
-    if not driver:
-        raise ValueError("DSN is missing a driver scheme")
-
-    env = {"driver": driver, "limit_style": "limit"}
-    if driver in {"sqlite", "sqlite3", "duckdb"}:
-        path = unquote(parsed.path or "")
-        if path.startswith("/") and not path.startswith("//"):
-            path = path[1:]
-        env["path"] = path
-        env["database"] = path
-    else:
-        if not parsed.hostname:
-            raise ValueError("DSN is missing a host")
-        env["host"] = parsed.hostname
-        if parsed.port is not None:
-            env["port"] = parsed.port
-        if parsed.username:
-            env["username"] = unquote(parsed.username)
-        if parsed.password:
-            env["password"] = unquote(parsed.password)
-        database = unquote(parsed.path.lstrip("/"))
-        if database:
-            env["database"] = database
-
-    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    if params:
-        env["params"] = params
-    return env
-
-
-def import_dbhub_sources(args, config):
-    data = load_toml(Path(args.from_dbhub_toml).expanduser())
-    sources = data.get("sources", [])
-    if not isinstance(sources, list):
-        raise ValueError("DBHub TOML must contain a sources array")
-
-    imported = []
-    requested_env = args.env
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        env_name = source.get("id") or source.get("name")
-        dsn = source.get("dsn")
-        if not env_name or not dsn:
-            continue
-        if requested_env and env_name != requested_env:
-            continue
-        if env_name in config["environments"] and not args.force:
-            raise ValueError(f"environment '{env_name}' already exists; use --force to replace it")
-        config["environments"][env_name] = env_from_dsn(str(dsn))
-        imported.append(env_name)
-
-    if requested_env and not imported:
-        raise ValueError(f"environment '{requested_env}' was not found in DBHub TOML")
-    if not imported:
-        raise ValueError("no importable DBHub sources found")
-    return imported
 
 
 def build_env(args):
@@ -194,7 +117,6 @@ def parse_args():
     parser.add_argument("--limit-style", default="limit", choices=["limit", "none"])
     parser.add_argument("--force", action="store_true", help="Replace an existing environment entry.")
     parser.add_argument("--non-interactive", action="store_true", help="Fail instead of prompting for missing fields.")
-    parser.add_argument("--from-dbhub-toml", help="Import one or all sources from a DBHub TOML file.")
     return parser.parse_args()
 
 
@@ -204,16 +126,13 @@ def main():
 
     try:
         config = load_existing(output)
-        if args.from_dbhub_toml:
-            imported = import_dbhub_sources(args, config)
-        else:
-            env_name, env = build_env(args)
-            if not env_name:
-                raise ValueError("--env is required in non-interactive mode")
-            if env_name in config["environments"] and not args.force:
-                raise ValueError(f"environment '{env_name}' already exists; use --force to replace it")
-            config["environments"][env_name] = env
-            imported = [env_name]
+        env_name, env = build_env(args)
+        if not env_name:
+            raise ValueError("--env is required in non-interactive mode")
+        if env_name in config["environments"] and not args.force:
+            raise ValueError(f"environment '{env_name}' already exists; use --force to replace it")
+        config["environments"][env_name] = env
+        imported = [env_name]
 
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("w", encoding="utf-8") as handle:

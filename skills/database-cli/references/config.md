@@ -38,14 +38,6 @@ scripts/init-config \
   --password-env QA01_DB_PASSWORD
 ```
 
-If the user already has DBHub configured, import existing sources from its TOML:
-
-```bash
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --force
-```
-
-This reads DBHub `sources[].id` as environment names and `sources[].dsn` as connection definitions. The generated file is still local, ignored, and `0600`. Do not print the TOML, DSN, or generated config because DBHub DSNs may contain passwords.
-
 The resulting `connections.local.json` uses direct database connection fields:
 
 ```json
@@ -78,7 +70,7 @@ Fields:
 - `username`: Optional if the database allows anonymous access.
 - `password`: Optional. Store only in ignored local files.
 - `password_env`: Optional. Name of an environment variable containing the password; preferred for production credentials.
-- `params`: Optional object of URL query parameters. The query wrapper filters parameters by driver before creating the temporary `sq` source; for example, DBHub MySQL `sslmode=disable` is not passed to MySQL because the driver rejects it.
+- `params`: Optional object of URL query parameters. The query wrapper filters parameters by driver before creating the temporary `sq` source.
 - `source`: Optional advanced mode. Use an existing `sq` source handle such as `@qnvip_qa01_commerce`; if present, direct connection fields are ignored.
 - `schema`: Optional. Passed as `--src.schema`; avoid setting it when the user should choose the database/schema in each SQL statement.
 - `sq_config`: Optional at top level or per environment. Passed to `sq --config`.

@@ -1,11 +1,11 @@
 ---
 name: database-cli
-description: "Use when Codex needs to inspect database schema, run safe read-only SQL, compare records across environments, or replace DBHub MCP database lookups with a local command-line workflow. This skill uses local database CLI tools, primarily sq, and preserves DBHub-style safety: never mutate database data directly; output repair SQL for humans to execute when changes are required."
+description: "Use when Codex needs to inspect database schema, run safe read-only SQL, compare records across environments, or produce human-reviewed repair SQL through a local command-line workflow. This skill uses local database CLI tools, primarily sq, and enforces read-only safety: never mutate database data directly; output repair SQL for humans to execute when changes are required."
 ---
 
 # Database CLI
 
-Use this skill for database-backed investigation through local CLI tools instead of DBHub MCP. Treat it as a read-only evidence tool. When invoked from the plugin root, the root `scripts/*` wrappers delegate to this skill's scripts. When installed directly under `~/.codex/skills/database-cli`, run scripts from that skill directory.
+Use this skill for database-backed investigation through local CLI tools. Treat it as a read-only evidence tool. When invoked from the plugin root, the root `scripts/*` wrappers delegate to this skill's scripts. When installed directly under `~/.codex/skills/database-cli`, run scripts from that skill directory.
 
 ## Hard Rules
 
@@ -49,16 +49,6 @@ scripts/init-config
 ```
 
 The initializer prompts for database server address/domain, optional port, username, and password storage. Default database/schema is optional; the user can choose the concrete database/schema in SQL with fully-qualified names.
-
-If the user provides an existing DBHub TOML path, migrate it instead of asking for every field:
-
-```bash
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --force
-scripts/db-query --list-envs
-scripts/db-query --env qa01 --sql "SELECT 1"
-```
-
-Do not display DBHub DSNs, TOML contents, or generated `connections.local.json` values because they can contain passwords.
 
 ## Query Workflow
 
@@ -114,12 +104,6 @@ Create or update local config non-interactively:
 
 ```bash
 scripts/init-config --env qa01 --driver mysql --host mysql-qa01.example.internal --username readonly_user --password-env QA01_DB_PASSWORD
-```
-
-Import existing DBHub connections:
-
-```bash
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --force
 ```
 
 ## Notes

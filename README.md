@@ -1,6 +1,6 @@
 # Database CLI Plugin
 
-这是一个 Codex Plugin，内置 `database-cli` Skill，用本地数据库 CLI 工作流替代 DBHub MCP 查询。它面向数据库问题排查：查看表结构、执行有范围的只读 SQL、跨环境核对记录，以及在需要修数时产出给人工执行的 SQL。
+这是一个 Codex Plugin，内置 `database-cli` Skill。它面向数据库问题排查：查看表结构、执行有范围的只读 SQL、跨环境核对记录，以及在需要修数时产出给人工执行的 SQL。
 
 底层使用 [`sq`](https://sq.io/) 作为数据库 CLI 后端，并通过本项目的 wrapper 做安全限制。
 
@@ -8,6 +8,7 @@
 
 - 通过 `scripts/db-query` 执行只读 SQL。
 - 通过本地 `connections.local.json` 保存连接配置。
+- 按环境名管理连接，例如 `qa01`、`prod`，让 Agent 和开发者使用同一套入口。
 - 默认按数据库实例/服务端连接，不把配置限制到某个 database/schema。
 - 支持只配置域名，不配置端口；适用于域名或反向代理已处理端口的场景。
 - 拦截常见写入、DDL、权限、事务、过程、锁、导出和副作用 SQL。
@@ -55,6 +56,27 @@ scripts/install
 
 标准 Codex Plugin/Skill 安装机制不会自动执行任意 post-install hook。因此，`scripts/install` 是这个插件的安装后必跑配置入口。
 
+## 从已有查询习惯迁移
+
+如果你已经知道常用环境名和连接信息，不需要先理解 `sq` 的 source 管理方式，直接用 `scripts/init-config` 创建本地环境即可：
+
+```bash
+scripts/init-config \
+  --env qa01 \
+  --driver mysql \
+  --host mysql-qa01.example.internal \
+  --username readonly_user \
+  --password-env QA01_DB_PASSWORD
+scripts/db-query --list-envs
+scripts/db-query --env qa01 --sql "SELECT 1"
+```
+
+建议保留你原来习惯的环境名，并在 SQL 里写全限定表名。这样 Agent 可以稳定复用同一套命令形态：
+
+```bash
+scripts/db-query --env qa01 --sql "SELECT id FROM qnvip_center_commerce.cc_order WHERE order_no = 'YP...'"
+```
+
 ## 通过 Agent 安装和修改配置
 
 用户可以直接让 Agent 代为安装和初始化。推荐把下面这段发给 Agent：
@@ -67,15 +89,6 @@ scripts/install
 4. 运行 scripts/install，帮我完成 database-cli 的安装后配置。
 如果缺少 sq，请先询问我是否允许用 Homebrew 安装。
 数据库连接信息由我提供，不要猜测地址、用户名、密码或访问范围。
-```
-
-如果我已经有 DBHub TOML，请让 Agent 直接迁移连接：
-
-```text
-请从 /path/to/dbhub.toml 导入 database-cli 连接配置：
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --force
-然后运行 scripts/db-query --list-envs，并用 QA 环境执行 SELECT 1 验证。
-不要展示 TOML、DSN 或 connections.local.json 中的密码。
 ```
 
 如果已经知道连接信息，也可以让 Agent 走非交互式配置：
@@ -122,17 +135,10 @@ scripts/init-config \
   --force
 ```
 
-从 DBHub TOML 导入：
-
-```bash
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --force
-```
-
 边界如下：
 
 - Agent 可以运行 `scripts/install`、`scripts/init-config`、`scripts/db-query`。
 - Agent 可以根据用户提供的信息创建或更新 `connections.local.json`。
-- Agent 可以在用户提供 DBHub TOML 路径时迁移已有连接。
 - Agent 可以帮用户检查 `sq` 是否安装，并在用户允许时通过 Homebrew 安装。
 - Agent 不会也不应该猜测数据库地址、用户名、密码或访问范围。
 - 敏感密码优先由用户配置到环境变量，然后在配置中使用 `password_env`。
@@ -204,18 +210,6 @@ scripts/init-config \
   --host mysql-qa01.example.internal \
   --username readonly_user \
   --password-env QA01_DB_PASSWORD
-```
-
-从已有 DBHub TOML 导入全部环境：
-
-```bash
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --force
-```
-
-只导入某个环境：
-
-```bash
-scripts/init-config --from-dbhub-toml /path/to/dbhub.toml --env qa01 --force
 ```
 
 如果必须显式指定端口：
