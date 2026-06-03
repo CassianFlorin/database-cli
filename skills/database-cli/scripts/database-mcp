@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -10,13 +11,34 @@ DB_QUERY = SKILL_ROOT / "scripts" / "db-query"
 SERVER_VERSION = "0.3.0"
 
 
-def tool_schema():
+def config_paths(explicit_path=None):
+    if explicit_path:
+        return [Path(explicit_path).expanduser()]
+    return [
+        SKILL_ROOT / "connections.local.json",
+        Path.cwd() / "connections.local.json",
+        Path.home() / ".config" / "database-cli" / "connections.json",
+    ]
+
+
+def load_config(explicit_path=None, required=False):
+    for path in config_paths(explicit_path):
+        if path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle), path
+    if required:
+        paths = ", ".join(str(path) for path in config_paths(explicit_path))
+        raise ValueError(f"No config file found. Checked: {paths}")
+    return {}, None
+
+
+def tool_schema(config_path=None):
     common_config = {
         "type": "string",
         "description": "Optional path to database-cli connections JSON.",
     }
     env = {"type": "string", "description": "Configured database-cli environment name."}
-    return [
+    base_tools = [
         {
             "name": "list_envs",
             "description": "List configured database-cli environments.",
@@ -69,7 +91,8 @@ def tool_schema():
                     "config": common_config,
                     "env": env,
                     "pattern": {"type": "string", "description": "SQL LIKE pattern, e.g. %order_no%."},
-                    "object_type": {"type": "string", "enum": ["schema", "table", "column", "index", "procedure"]},
+                    "object_type": {"type": "string", "enum": ["schema", "table", "column", "index", "procedure", "function"]},
+                    "detail_level": {"type": "string", "enum": ["names", "summary", "full"]},
                     "schema": {"type": "string", "description": "Optional schema/database filter."},
                     "table": {"type": "string", "description": "Optional table filter for column/index search."},
                     "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
@@ -94,6 +117,62 @@ def tool_schema():
             },
         },
     ]
+    config, _ = load_config(config_path, required=False)
+    tools = config.get("tools", {})
+    if isinstance(tools, dict):
+        for name, spec in sorted(tools.items()):
+            if not is_valid_tool_name(name) or not isinstance(spec, dict):
+                continue
+            parameters = spec.get("parameters", {})
+            properties = {"config": common_config}
+            required = []
+            if isinstance(parameters, dict):
+                for param_name, param_spec in parameters.items():
+                    if not is_valid_param_name(param_name):
+                        continue
+                    schema = parameter_schema(param_spec)
+                    properties[param_name] = schema
+                    if isinstance(param_spec, dict) and "default" not in param_spec and not param_spec.get("optional"):
+                        required.append(param_name)
+            properties["_format"] = {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]}
+            properties["_limit"] = {"type": "integer", "minimum": 0}
+            properties["_print_command"] = {"type": "boolean"}
+            base_tools.append(
+                {
+                    "name": name,
+                    "description": spec.get("description") or f"Run configured database-cli tool '{name}'.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                        "additionalProperties": False,
+                    },
+                }
+            )
+    return base_tools
+
+
+def is_valid_tool_name(name):
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", str(name)))
+
+
+def is_valid_param_name(name):
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)))
+
+
+def parameter_schema(param_spec):
+    if not isinstance(param_spec, dict):
+        return {"type": "string"}
+    schema = {"type": param_spec.get("type", "string")}
+    if param_spec.get("description"):
+        schema["description"] = param_spec["description"]
+    if "enum" in param_spec:
+        schema["enum"] = param_spec["enum"]
+    if "minimum" in param_spec:
+        schema["minimum"] = param_spec["minimum"]
+    if "maximum" in param_spec:
+        schema["maximum"] = param_spec["maximum"]
+    return schema
 
 
 def add_common_args(cmd, args):
@@ -131,6 +210,8 @@ def command_for_tool(name, args):
         cmd.extend(["--env", args["env"], "--search-objects", args["pattern"]])
         if args.get("object_type"):
             cmd.extend(["--object-type", args["object_type"]])
+        if args.get("detail_level"):
+            cmd.extend(["--detail-level", args["detail_level"]])
         if args.get("table"):
             cmd.extend(["--table", args["table"]])
         return cmd
@@ -144,8 +225,109 @@ def command_for_tool(name, args):
     raise ValueError(f"Unknown tool '{name}'.")
 
 
+def sql_literal(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def validate_custom_arg(name, spec, value):
+    if not isinstance(spec, dict):
+        return value
+    if value is None:
+        return value
+    if "enum" in spec and value not in spec["enum"]:
+        allowed = ", ".join(str(item) for item in spec["enum"])
+        raise ValueError(f"Parameter '{name}' must be one of: {allowed}.")
+    expected = spec.get("type", "string")
+    if expected == "integer":
+        if isinstance(value, bool):
+            raise ValueError(f"Parameter '{name}' must be an integer.")
+        converted = int(value)
+    elif expected == "number":
+        if isinstance(value, bool):
+            raise ValueError(f"Parameter '{name}' must be a number.")
+        converted = float(value)
+    elif expected == "boolean":
+        if isinstance(value, bool):
+            return value
+        if str(value).lower() in {"true", "1", "yes"}:
+            return True
+        if str(value).lower() in {"false", "0", "no"}:
+            return False
+        raise ValueError(f"Parameter '{name}' must be a boolean.")
+    else:
+        return str(value)
+    if "minimum" in spec and converted < spec["minimum"]:
+        raise ValueError(f"Parameter '{name}' must be >= {spec['minimum']}.")
+    if "maximum" in spec and converted > spec["maximum"]:
+        raise ValueError(f"Parameter '{name}' must be <= {spec['maximum']}.")
+    return converted
+
+
+def render_custom_sql(spec, args):
+    sql = spec.get("sql")
+    if not sql:
+        raise ValueError("Configured tool is missing sql.")
+    parameters = spec.get("parameters", {})
+    values = {}
+    if isinstance(parameters, dict):
+        for name, param_spec in parameters.items():
+            if not is_valid_param_name(name):
+                continue
+            if name in args:
+                value = args[name]
+            elif isinstance(param_spec, dict) and "default" in param_spec:
+                value = param_spec["default"]
+            elif isinstance(param_spec, dict) and param_spec.get("optional"):
+                value = None
+            else:
+                raise ValueError(f"Missing required parameter '{name}'.")
+            values[name] = validate_custom_arg(name, param_spec, value)
+
+    def replace(match):
+        name = match.group(1)
+        if name not in values:
+            raise ValueError(f"SQL references unknown parameter '{name}'.")
+        return sql_literal(values[name])
+
+    return re.sub(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", replace, sql)
+
+
+def command_for_custom_tool(name, args):
+    config, _ = load_config(args.get("config"), required=True)
+    tools = config.get("tools", {})
+    if name not in tools or not isinstance(tools[name], dict):
+        raise ValueError(f"Unknown tool '{name}'.")
+    spec = tools[name]
+    env = spec.get("env") or args.get("env")
+    if not env:
+        raise ValueError(f"Configured tool '{name}' must define env.")
+    sql = render_custom_sql(spec, args)
+    cmd = [str(DB_QUERY)]
+    if args.get("config"):
+        cmd.extend(["--config", args["config"]])
+    if args.get("_format"):
+        cmd.extend(["--format", args["_format"]])
+    if args.get("_limit") is not None:
+        cmd.extend(["--limit", str(args["_limit"])])
+    if spec.get("schema"):
+        cmd.extend(["--schema", spec["schema"]])
+    if args.get("_print_command"):
+        cmd.append("--print-command")
+    cmd.extend(["--env", env, "--sql", sql])
+    return cmd
+
+
 def run_tool(name, args):
-    cmd = command_for_tool(name, args)
+    try:
+        cmd = command_for_tool(name, args)
+    except ValueError:
+        cmd = command_for_custom_tool(name, args)
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
     text = proc.stdout
     if proc.stderr:
@@ -185,7 +367,9 @@ def handle(message):
                 "serverInfo": {"name": "database-cli", "version": SERVER_VERSION},
             }
         elif method == "tools/list":
-            response["result"] = {"tools": tool_schema()}
+            params = message.get("params") or {}
+            arguments = params.get("arguments") or {}
+            response["result"] = {"tools": tool_schema(arguments.get("config"))}
         elif method == "tools/call":
             params = message.get("params") or {}
             response["result"] = run_tool(params["name"], params.get("arguments") or {})

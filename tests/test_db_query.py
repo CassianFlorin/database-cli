@@ -1,4 +1,5 @@
 import json
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +8,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_QUERY = ROOT / "scripts" / "db-query"
+
+
+def printed_sql(stdout):
+    command = [line for line in stdout.splitlines() if line.startswith("sq ")][-1]
+    return shlex.split(command)[-1]
 
 
 class DbQueryTest(unittest.TestCase):
@@ -93,6 +99,106 @@ class DbQueryTest(unittest.TestCase):
             self.assertIn("ROUTINE_SCHEMA =", result.stdout)
             self.assertIn("qnvip_center_commerce", result.stdout)
             self.assertIn("LIMIT 200", result.stdout)
+
+    def test_prints_mysql_function_search_with_full_detail(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(
+                tmpdir,
+                {
+                    "driver": "mysql",
+                    "host": "mysql-qa01.example.internal",
+                    "username": "readonly_user",
+                },
+            )
+
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--config",
+                    str(config),
+                    "--env",
+                    "qa01",
+                    "--search-objects",
+                    "%calc%",
+                    "--object-type",
+                    "function",
+                    "--detail-level",
+                    "full",
+                    "--print-command",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            sql = printed_sql(result.stdout)
+            self.assertIn("INFORMATION_SCHEMA.ROUTINES", sql)
+            self.assertIn("ROUTINE_TYPE = 'FUNCTION'", sql)
+            self.assertIn("ROUTINE_DEFINITION", sql)
+            self.assertIn("ROUTINE_COMMENT", sql)
+
+    def test_configured_max_rows_caps_auto_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(
+                tmpdir,
+                {
+                    "driver": "mysql",
+                    "host": "mysql-qa01.example.internal",
+                    "username": "readonly_user",
+                    "max_rows": 50,
+                },
+            )
+
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--config",
+                    str(config),
+                    "--env",
+                    "qa01",
+                    "--limit",
+                    "500",
+                    "--sql",
+                    "SELECT id FROM cc_order",
+                    "--print-command",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertIn("SELECT id FROM cc_order LIMIT 50", result.stdout)
+
+    def test_readonly_false_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(
+                tmpdir,
+                {
+                    "driver": "mysql",
+                    "host": "mysql-qa01.example.internal",
+                    "username": "readonly_user",
+                    "readonly": False,
+                },
+            )
+
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--config",
+                    str(config),
+                    "--env",
+                    "qa01",
+                    "--sql",
+                    "SELECT 1",
+                    "--print-command",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("readonly=false", result.stderr)
 
 
 if __name__ == "__main__":

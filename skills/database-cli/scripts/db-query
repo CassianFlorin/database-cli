@@ -201,15 +201,34 @@ def validate_sql(sql):
 
 
 def maybe_add_limit(sql, token, limit, limit_style, no_auto_limit):
-    if no_auto_limit or limit <= 0 or limit_style == "none":
+    return maybe_add_limit_with_cap(sql, token, limit, limit_style, no_auto_limit, None)
+
+
+def maybe_add_limit_with_cap(sql, token, limit, limit_style, no_auto_limit, hard_limit):
+    if limit_style == "none":
         return sql.strip().rstrip(";")
     if token not in {"select", "with"}:
         return sql.strip().rstrip(";")
 
+    requested_limit = limit
+    if hard_limit and hard_limit > 0:
+        requested_limit = hard_limit if requested_limit <= 0 else min(requested_limit, hard_limit)
+
     cleaned = strip_comments_and_literals(sql)
-    if re.search(r"\blimit\b|\bfetch\s+first\b|\btop\b", cleaned, re.I):
-        return sql.strip().rstrip(";")
-    return f"{sql.strip().rstrip(';')} LIMIT {limit}"
+    limited_sql = sql.strip().rstrip(";")
+    limit_match = re.search(r"\blimit\s+(\d+)\b", cleaned, re.I)
+    if limit_match:
+        if hard_limit and hard_limit > 0 and int(limit_match.group(1)) > hard_limit:
+            start, end = limit_match.span(1)
+            return f"{limited_sql[:start]}{hard_limit}{limited_sql[end:]}"
+        return limited_sql
+    if re.search(r"\bfetch\s+first\b|\btop\b", cleaned, re.I):
+        return limited_sql
+    if no_auto_limit and not hard_limit:
+        return limited_sql
+    if requested_limit <= 0:
+        return limited_sql
+    return f"{limited_sql} LIMIT {requested_limit}"
 
 
 def sql_literal(value):
@@ -237,12 +256,16 @@ def build_search_objects_sql(env, args):
     pattern = args.search_objects
     schema_filter = args.schema
     table_filter = args.table
+    detail_level = args.detail_level
 
     if driver in {"mysql", "mariadb"}:
         if object_type == "schema":
             clauses = [f"SCHEMA_NAME LIKE {sql_literal(pattern)}"]
+            columns = "SCHEMA_NAME AS schema_name"
+            if detail_level in {"summary", "full"}:
+                columns += ", DEFAULT_CHARACTER_SET_NAME AS default_character_set_name, DEFAULT_COLLATION_NAME AS default_collation_name"
             return (
-                "SELECT SCHEMA_NAME AS schema_name "
+                f"SELECT {columns} "
                 "FROM INFORMATION_SCHEMA.SCHEMATA"
                 f"{where_clause(clauses)} "
                 "ORDER BY SCHEMA_NAME"
@@ -250,8 +273,21 @@ def build_search_objects_sql(env, args):
         if object_type == "table":
             clauses = [f"TABLE_NAME LIKE {sql_literal(pattern)}"]
             append_filter(clauses, "TABLE_SCHEMA", schema_filter)
+            if detail_level == "names":
+                columns = "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name"
+            elif detail_level == "full":
+                columns = (
+                    "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, TABLE_TYPE AS table_type, "
+                    "ENGINE AS engine, TABLE_ROWS AS table_rows, TABLE_COLLATION AS table_collation, "
+                    "CREATE_TIME AS create_time, UPDATE_TIME AS update_time, TABLE_COMMENT AS table_comment"
+                )
+            else:
+                columns = (
+                    "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, TABLE_TYPE AS table_type, "
+                    "TABLE_ROWS AS table_rows, TABLE_COMMENT AS table_comment"
+                )
             return (
-                "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, TABLE_TYPE AS table_type "
+                f"SELECT {columns} "
                 "FROM INFORMATION_SCHEMA.TABLES"
                 f"{where_clause(clauses)} "
                 "ORDER BY TABLE_SCHEMA, TABLE_NAME"
@@ -260,10 +296,24 @@ def build_search_objects_sql(env, args):
             clauses = [f"COLUMN_NAME LIKE {sql_literal(pattern)}"]
             append_filter(clauses, "TABLE_SCHEMA", schema_filter)
             append_filter(clauses, "TABLE_NAME", table_filter)
+            if detail_level == "names":
+                columns = "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name"
+            elif detail_level == "full":
+                columns = (
+                    "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name, "
+                    "ORDINAL_POSITION AS ordinal_position, DATA_TYPE AS data_type, COLUMN_TYPE AS column_type, "
+                    "IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, COLUMN_KEY AS column_key, "
+                    "EXTRA AS extra, CHARACTER_MAXIMUM_LENGTH AS character_maximum_length, "
+                    "NUMERIC_PRECISION AS numeric_precision, COLUMN_COMMENT AS column_comment"
+                )
+            else:
+                columns = (
+                    "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name, "
+                    "DATA_TYPE AS data_type, COLUMN_TYPE AS column_type, IS_NULLABLE AS is_nullable, "
+                    "COLUMN_KEY AS column_key, COLUMN_COMMENT AS column_comment"
+                )
             return (
-                "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name, "
-                "DATA_TYPE AS data_type, COLUMN_TYPE AS column_type, IS_NULLABLE AS is_nullable, "
-                "COLUMN_KEY AS column_key, COLUMN_COMMENT AS column_comment "
+                f"SELECT {columns} "
                 "FROM INFORMATION_SCHEMA.COLUMNS"
                 f"{where_clause(clauses)} "
                 "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
@@ -272,20 +322,47 @@ def build_search_objects_sql(env, args):
             clauses = [f"INDEX_NAME LIKE {sql_literal(pattern)}"]
             append_filter(clauses, "TABLE_SCHEMA", schema_filter)
             append_filter(clauses, "TABLE_NAME", table_filter)
+            if detail_level == "names":
+                columns = "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, INDEX_NAME AS index_name"
+            elif detail_level == "full":
+                columns = (
+                    "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, INDEX_NAME AS index_name, "
+                    "COLUMN_NAME AS column_name, NON_UNIQUE AS non_unique, SEQ_IN_INDEX AS seq_in_index, "
+                    "INDEX_TYPE AS index_type, CARDINALITY AS cardinality, SUB_PART AS sub_part, "
+                    "COLLATION AS collation, NULLABLE AS nullable, INDEX_COMMENT AS index_comment"
+                )
+            else:
+                columns = (
+                    "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, INDEX_NAME AS index_name, "
+                    "COLUMN_NAME AS column_name, NON_UNIQUE AS non_unique, SEQ_IN_INDEX AS seq_in_index"
+                )
             return (
-                "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, INDEX_NAME AS index_name, "
-                "COLUMN_NAME AS column_name, NON_UNIQUE AS non_unique, SEQ_IN_INDEX AS seq_in_index "
+                f"SELECT {columns} "
                 "FROM INFORMATION_SCHEMA.STATISTICS"
                 f"{where_clause(clauses)} "
                 "ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
             )
-        if object_type == "procedure":
+        if object_type in {"procedure", "function"}:
             clauses = [f"ROUTINE_NAME LIKE {sql_literal(pattern)}"]
             append_filter(clauses, "ROUTINE_SCHEMA", schema_filter)
+            clauses.append(f"ROUTINE_TYPE = {sql_literal(object_type.upper())}")
+            if detail_level == "names":
+                columns = "ROUTINE_SCHEMA AS routine_schema, ROUTINE_NAME AS routine_name, ROUTINE_TYPE AS routine_type"
+            elif detail_level == "full":
+                columns = (
+                    "ROUTINE_SCHEMA AS routine_schema, ROUTINE_NAME AS routine_name, ROUTINE_TYPE AS routine_type, "
+                    "DATA_TYPE AS data_type, CREATED AS created, LAST_ALTERED AS last_altered, "
+                    "SECURITY_TYPE AS security_type, DEFINER AS definer, SQL_MODE AS sql_mode, "
+                    "ROUTINE_COMMENT AS routine_comment, ROUTINE_DEFINITION AS routine_definition"
+                )
+            else:
+                columns = (
+                    "ROUTINE_SCHEMA AS routine_schema, ROUTINE_NAME AS routine_name, "
+                    "ROUTINE_TYPE AS routine_type, DATA_TYPE AS data_type, CREATED AS created, "
+                    "LAST_ALTERED AS last_altered"
+                )
             return (
-                "SELECT ROUTINE_SCHEMA AS routine_schema, ROUTINE_NAME AS routine_name, "
-                "ROUTINE_TYPE AS routine_type, DATA_TYPE AS data_type, CREATED AS created, "
-                "LAST_ALTERED AS last_altered "
+                f"SELECT {columns} "
                 "FROM INFORMATION_SCHEMA.ROUTINES"
                 f"{where_clause(clauses)} "
                 "ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME"
@@ -293,8 +370,11 @@ def build_search_objects_sql(env, args):
 
     if object_type == "schema":
         clauses = [f"schema_name LIKE {sql_literal(pattern)}"]
+        columns = "schema_name"
+        if detail_level in {"summary", "full"}:
+            columns += ", catalog_name, schema_owner"
         return (
-            "SELECT schema_name "
+            f"SELECT {columns} "
             "FROM information_schema.schemata"
             f"{where_clause(clauses)} "
             "ORDER BY schema_name"
@@ -302,8 +382,14 @@ def build_search_objects_sql(env, args):
     if object_type == "table":
         clauses = [f"table_name LIKE {sql_literal(pattern)}"]
         append_filter(clauses, "table_schema", schema_filter)
+        if detail_level == "names":
+            columns = "table_schema, table_name"
+        elif detail_level == "full":
+            columns = "table_schema, table_name, table_type, self_referencing_column_name, reference_generation"
+        else:
+            columns = "table_schema, table_name, table_type"
         return (
-            "SELECT table_schema, table_name, table_type "
+            f"SELECT {columns} "
             "FROM information_schema.tables"
             f"{where_clause(clauses)} "
             "ORDER BY table_schema, table_name"
@@ -312,8 +398,17 @@ def build_search_objects_sql(env, args):
         clauses = [f"column_name LIKE {sql_literal(pattern)}"]
         append_filter(clauses, "table_schema", schema_filter)
         append_filter(clauses, "table_name", table_filter)
+        if detail_level == "names":
+            columns = "table_schema, table_name, column_name"
+        elif detail_level == "full":
+            columns = (
+                "table_schema, table_name, column_name, ordinal_position, column_default, "
+                "is_nullable, data_type, character_maximum_length, numeric_precision, udt_name"
+            )
+        else:
+            columns = "table_schema, table_name, column_name, data_type, is_nullable"
         return (
-            "SELECT table_schema, table_name, column_name, data_type, is_nullable "
+            f"SELECT {columns} "
             "FROM information_schema.columns"
             f"{where_clause(clauses)} "
             "ORDER BY table_schema, table_name, ordinal_position"
@@ -322,18 +417,34 @@ def build_search_objects_sql(env, args):
         clauses = [f"indexname LIKE {sql_literal(pattern)}"]
         append_filter(clauses, "schemaname", schema_filter)
         append_filter(clauses, "tablename", table_filter)
+        if detail_level == "names":
+            columns = "schemaname AS table_schema, tablename AS table_name, indexname AS index_name"
+        else:
+            columns = (
+                "schemaname AS table_schema, tablename AS table_name, indexname AS index_name, "
+                "indexdef AS index_definition"
+            )
         return (
-            "SELECT schemaname AS table_schema, tablename AS table_name, indexname AS index_name, "
-            "indexdef AS index_definition "
+            f"SELECT {columns} "
             "FROM pg_catalog.pg_indexes"
             f"{where_clause(clauses)} "
             "ORDER BY schemaname, tablename, indexname"
         )
-    if object_type == "procedure":
+    if object_type in {"procedure", "function"}:
         clauses = [f"routine_name LIKE {sql_literal(pattern)}"]
         append_filter(clauses, "routine_schema", schema_filter)
+        clauses.append(f"routine_type = {sql_literal(object_type.upper())}")
+        if detail_level == "names":
+            columns = "routine_schema, routine_name, routine_type"
+        elif detail_level == "full":
+            columns = (
+                "routine_schema, routine_name, routine_type, data_type, type_udt_name, "
+                "external_language, security_type, is_null_call, routine_definition"
+            )
+        else:
+            columns = "routine_schema, routine_name, routine_type, data_type"
         return (
-            "SELECT routine_schema, routine_name, routine_type, data_type "
+            f"SELECT {columns} "
             "FROM information_schema.routines"
             f"{where_clause(clauses)} "
             "ORDER BY routine_schema, routine_name"
@@ -371,6 +482,40 @@ def get_env(config, env_name):
             f"Environment '{env_name}' must define either 'source' or direct connection fields."
         )
     return env
+
+
+def bool_value(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def positive_int(value):
+    if value in (None, ""):
+        return 0
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Expected a positive integer, got {value!r}.") from exc
+    return number if number > 0 else 0
+
+
+def enforce_readonly(config, env, env_name):
+    if not bool_value(config.get("readonly"), True):
+        raise ConfigError("Top-level readonly=false is not supported; database-cli only runs read-only queries.")
+    if not bool_value(env.get("readonly"), True):
+        raise ConfigError(f"Environment '{env_name}' sets readonly=false; database-cli only runs read-only queries.")
+
+
+def configured_max_rows(config, env):
+    limits = []
+    for value in (config.get("max_rows"), env.get("max_rows")):
+        limit = positive_int(value)
+        if limit:
+            limits.append(limit)
+    return min(limits) if limits else 0
 
 
 def env_value(env, *names):
@@ -703,7 +848,8 @@ def parse_args():
     parser.add_argument("--check-sql", help="Validate SQL safety without executing.")
     parser.add_argument("--inspect", nargs="?", const="", help="Inspect a source or table.")
     parser.add_argument("--search-objects", help="Search schema/table/column/index/procedure metadata with a SQL LIKE pattern.")
-    parser.add_argument("--object-type", choices=["schema", "table", "column", "index", "procedure"], default="table")
+    parser.add_argument("--object-type", choices=["schema", "table", "column", "index", "procedure", "function"], default="table")
+    parser.add_argument("--detail-level", choices=["names", "summary", "full"], default="summary")
     parser.add_argument("--table", help="Limit column/index metadata search to one table.")
     parser.add_argument("--list-envs", action="store_true", help="List configured environments.")
     parser.add_argument("--format", choices=["json", "csv", "markdown", "text", "yaml"], default="json")
@@ -736,27 +882,31 @@ def main():
             raise ConfigError("Missing --env. Use --list-envs to see configured environments.")
 
         env = get_env(config, args.env)
+        enforce_readonly(config, env, args.env)
+        max_rows = configured_max_rows(config, env)
 
         if args.sql:
             _, token = validate_sql(args.sql)
-            sql = maybe_add_limit(
+            sql = maybe_add_limit_with_cap(
                 args.sql,
                 token,
                 args.limit,
                 env.get("limit_style", "limit"),
                 args.no_auto_limit,
+                max_rows,
             )
             source, sq_config, setup = prepare_source(args, config, env, args.env)
             cmd = build_sql_command(args, config, env, sql, source, sq_config)
         elif args.search_objects:
             search_sql = build_search_objects_sql(env, args)
             _, token = validate_sql(search_sql)
-            sql = maybe_add_limit(
+            sql = maybe_add_limit_with_cap(
                 search_sql,
                 token,
                 args.limit,
                 env.get("limit_style", "limit"),
                 args.no_auto_limit,
+                max_rows,
             )
             source, sq_config, setup = prepare_source(args, config, env, args.env)
             cmd = build_sql_command(args, config, env, sql, source, sq_config)

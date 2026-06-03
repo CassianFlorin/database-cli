@@ -1,11 +1,13 @@
 ---
 name: database-cli
-description: "Use when Codex needs to inspect database schema, search schema/table/column/index/procedure metadata, run safe read-only SQL, compare records across environments, or produce human-reviewed repair SQL through a local command-line or MCP workflow. This skill uses database-cli wrappers over local database tools and enforces read-only safety: never mutate database data directly; output repair SQL for humans to execute when changes are required."
+description: "Use when Codex needs to inspect database schema, search schema/table/column/index/procedure metadata, run safe read-only SQL, compare records across environments, or produce human-reviewed repair SQL through the database-cli local command-line workflow. MCP is only an optional adapter over the same CLI. This skill enforces read-only safety: never mutate database data directly; output repair SQL for humans to execute when changes are required."
 ---
 
 # Database CLI
 
-Use this skill for database-backed investigation through local CLI tools or the bundled stdio MCP server. Treat it as a read-only evidence tool. When invoked from the plugin root, the root `scripts/*` wrappers delegate to this skill's scripts. When installed directly under `~/.codex/skills/database-cli`, run scripts from that skill directory.
+Use this skill for database-backed investigation through the local database CLI workflow. Treat it as a read-only evidence tool. When invoked from the plugin root, the root `scripts/*` wrappers delegate to this skill's scripts. When installed directly under `~/.codex/skills/database-cli`, run scripts from that skill directory.
+
+`database-cli` is CLI-first. `scripts/db-query` is the authoritative execution path for schema discovery, read-only SQL, safety checks, limits, and repair-SQL evidence gathering. `scripts/database-mcp` is only an optional adapter for clients that need MCP tools; it must not become a separate query engine or product surface.
 
 ## Hard Rules
 
@@ -15,7 +17,11 @@ Use this skill for database-backed investigation through local CLI tools or the 
 - Refuse SQL containing mutation, DDL, permission, transaction, procedure, lock, export, or side-effect keywords.
 - Keep queries scoped with exact business keys, selected columns, and a bounded result set.
 - Use `scripts/db-query` rather than calling `sq` directly. The wrapper enforces read-only SQL checks and consistent output.
-- If an Agent needs DBHub-like structured tools, use `scripts/database-mcp`; it delegates to `scripts/db-query` and preserves the same safety boundary.
+- If an Agent needs structured MCP tools, use `scripts/database-mcp`; it delegates to `scripts/db-query` and preserves the same safety boundary.
+- Do not treat this project as a DBHub replacement or MCP platform. Prefer improving CLI and Skill workflow first; keep MCP thin.
+- Treat configured `max_rows` as a hard result cap. Do not bypass it with larger `--limit` values.
+- Treat `readonly=false` as invalid for this skill; it never enables write SQL.
+- Configured MCP custom tools are allowed only for parameterized read-only SQL templates. Do not put repair SQL in a custom tool.
 - If data must be repaired, output SQL for a human to execute. Include target environment, pre-check SQL, change SQL, post-check SQL, and rollback or recovery notes.
 
 ## Setup Check
@@ -67,14 +73,17 @@ scripts/db-query --env qa01 --inspect
 scripts/db-query --env qa01 --inspect table_name
 ```
 
-4. For DBHub-style object search, use metadata search:
+4. For object metadata search, use:
 
 ```bash
 scripts/db-query --env qa01 --search-objects "%cc_order%" --object-type table
 scripts/db-query --env qa01 --search-objects "%order_no%" --object-type column --table cc_order
 scripts/db-query --env qa01 --search-objects "%idx_order%" --object-type index --table cc_order
 scripts/db-query --env qa01 --search-objects "%sync_order%" --object-type procedure
+scripts/db-query --env qa01 --search-objects "%calc%" --object-type function --detail-level full
 ```
+
+Use `--detail-level names` for quick discovery, `--detail-level summary` for normal investigation, and `--detail-level full` when comments, routine definitions, or index details matter.
 
 5. For data lookup, run a bounded read-only query:
 
@@ -84,15 +93,17 @@ scripts/db-query --env qa01 --sql "SELECT id, order_no, status FROM dbname.schem
 
 6. Summarize only the fields needed to answer the user. Avoid spreading unrelated sensitive data.
 
-## MCP Workflow
+## Optional MCP Adapter
 
-When a client supports custom MCP servers, point it at:
+When a client needs MCP tools, point it at:
 
 ```bash
 scripts/database-mcp
 ```
 
-The server exposes `list_envs`, `query_readonly`, `inspect`, `search_objects`, and `check_sql`. `search_objects` supports schema, table, column, index, and procedure metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it when you want Agent-native structured calls without installing DBHub.
+The adapter exposes `list_envs`, `query_readonly`, `inspect`, `search_objects`, and `check_sql`. `search_objects` supports schema, table, column, index, procedure, and function metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it only when Agent-native structured calls are useful; CLI remains the source of truth.
+
+If `connections.local.json` has a top-level `tools` object, `scripts/database-mcp` also exposes those parameterized read-only custom tools. Parameters are rendered as SQL literals and then passed through `scripts/db-query`, so the same read-only validator and `max_rows` cap still apply.
 
 ## Useful Commands
 

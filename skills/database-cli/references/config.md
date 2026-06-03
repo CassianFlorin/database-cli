@@ -48,6 +48,7 @@ The resulting `connections.local.json` uses direct database connection fields:
       "host": "mysql-qa01.example.internal",
       "username": "readonly_user",
       "password": "replace-with-local-password",
+      "max_rows": 200,
       "limit_style": "limit"
     },
     "prod": {
@@ -75,6 +76,48 @@ Fields:
 - `schema`: Optional. Passed as `--src.schema`; avoid setting it when the user should choose the database/schema in each SQL statement.
 - `sq_config`: Optional at top level or per environment. Passed to `sq --config`.
 - `limit_style`: Optional. Use `limit` for MySQL/Postgres/SQLite/DuckDB. Use `none` if the database does not accept appended `LIMIT`.
+- `max_rows`: Optional positive integer at top level or per environment. It is a hard cap for auto-appended limits and larger existing `LIMIT` clauses.
+- `readonly`: Optional boolean. Only `true` or omitted is supported. `false` is rejected because this skill never executes write SQL.
+
+## Optional MCP Custom Tools
+
+Top-level `tools` entries expose optional parameterized read-only tools from `scripts/database-mcp`. This is an adapter convenience for MCP clients, not the core product model. The rendered SQL still goes through `scripts/db-query`, so CLI safety checks and `max_rows` remain authoritative.
+
+```json
+{
+  "environments": {
+    "qa01": {
+      "driver": "mysql",
+      "host": "mysql-qa01.example.internal",
+      "username": "readonly_user",
+      "password_env": "QA01_DB_PASSWORD",
+      "max_rows": 100
+    }
+  },
+  "tools": {
+    "find_order": {
+      "description": "Find one order by order number.",
+      "env": "qa01",
+      "sql": "SELECT id, order_no, status FROM cc_order WHERE order_no = :order_no",
+      "parameters": {
+        "order_no": {
+          "type": "string",
+          "description": "Order number."
+        }
+      }
+    }
+  }
+}
+```
+
+Rules:
+
+- Tool names and parameter names must use letters, numbers, or underscores and start with a letter or underscore.
+- `sql` must be a read-only statement after parameters are rendered.
+- Placeholders use `:param_name`; values are rendered as SQL literals and escaped.
+- Parameter schemas support `type`, `description`, `enum`, `default`, `optional`, `minimum`, and `maximum`.
+- Reserved call-time keys are `config`, `_format`, `_limit`, and `_print_command`.
+- Do not define repair or mutation SQL as a custom tool.
 
 ## Advanced Handle Config
 
@@ -103,3 +146,5 @@ When a password is configured, the wrapper does not place the password in the co
 ## Safety Model
 
 The wrapper blocks common mutation and side-effect SQL before calling `sq`. This is a guardrail, not a full SQL parser. If a query is questionable, rewrite it as a simpler read-only `SELECT` with exact predicates.
+
+When `max_rows` is configured, it is a hard safety cap. A larger CLI `--limit` or a larger SQL `LIMIT` is reduced to `max_rows`.

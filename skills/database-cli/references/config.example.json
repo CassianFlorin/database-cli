@@ -5,6 +5,7 @@
       "host": "mysql-qa01.example.internal",
       "username": "readonly_user",
       "password": "replace-with-local-password",
+      "max_rows": 200,
       "limit_style": "limit"
     },
     "prod": {
@@ -12,7 +13,21 @@
       "host": "mysql-prod.example.internal",
       "username": "readonly_user",
       "password_env": "QNVIP_PROD_DB_PASSWORD",
+      "max_rows": 100,
       "limit_style": "limit"
+    }
+  },
+  "tools": {
+    "find_order": {
+      "description": "Find one order by order number.",
+      "env": "qa01",
+      "sql": "SELECT id, order_no, status FROM cc_order WHERE order_no = :order_no",
+      "parameters": {
+        "order_no": {
+          "type": "string",
+          "description": "Order number."
+        }
+      }
     }
   }
 }
