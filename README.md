@@ -1,6 +1,6 @@
 # Database CLI Plugin
 
-这是一个 Codex Plugin，内置 `database-cli` Skill。它面向数据库问题排查：查看表结构、搜索 schema/table/column/index、执行有范围的只读 SQL、跨环境核对记录，以及在需要修数时产出给人工执行的 SQL。
+这是一个 Codex Plugin，内置 `database-cli` Skill。它面向数据库问题排查：查看表结构、搜索 schema/table/column/index/procedure、执行有范围的只读 SQL、跨环境核对记录，以及在需要修数时产出给人工执行的 SQL。
 
 底层使用 [`sq`](https://sq.io/) 作为数据库 CLI 后端，并通过本项目的 wrapper 做安全限制。Agent 可以直接使用本项目提供的 CLI 或 stdio MCP server，不需要再安装 DBHub 这类额外数据库 MCP 工具。
 
@@ -12,7 +12,7 @@
 - 按环境名管理连接，例如 `qa01`、`prod`，让 Agent 和开发者使用同一套入口。
 - 默认按数据库实例/服务端连接，不把配置限制到某个 database/schema。
 - 支持只配置域名，不配置端口；适用于域名或反向代理已处理端口的场景。
-- 支持 DBHub 风格对象搜索：schema、table、column、index metadata。
+- 支持 DBHub 风格对象搜索：schema、table、column、index、procedure metadata。
 - 拦截常见写入、DDL、权限、事务、过程、锁、导出和副作用 SQL。
 - 避免把密码写入命令行 DSN；本地密钥文件不提交到仓库。
 
@@ -89,6 +89,7 @@ scripts/db-query --env qa01 --sql "SELECT id FROM qnvip_center_commerce.cc_order
 scripts/db-query --env qa01 --search-objects "%cc_order%" --object-type table
 scripts/db-query --env qa01 --search-objects "%order_no%" --object-type column --table cc_order
 scripts/db-query --env qa01 --search-objects "%idx_order%" --object-type index --table cc_order
+scripts/db-query --env qa01 --search-objects "%sync_order%" --object-type procedure
 ```
 
 当前对象搜索支持 MySQL/MariaDB/Postgres 直连配置。其他数据库或高级 `sq source` 配置仍可使用：
@@ -105,8 +106,10 @@ scripts/db-query --env qa01 --inspect cc_order
 - `list_envs`：列出当前配置的环境。
 - `query_readonly`：执行只读 SQL。
 - `inspect`：查看 source 或表结构。
-- `search_objects`：搜索 schema/table/column/index metadata。
+- `search_objects`：搜索 schema/table/column/index/procedure metadata。
 - `check_sql`：只校验 SQL 安全性，不执行。
+
+每次 `tools/call` 都保留文本 `content`，并额外返回 `structuredContent`，包含 `exit_code`、`stdout`、`stderr`，以及 stdout 可解析为 JSON 时的 `json` 字段。
 
 MCP 客户端可以把 command 指到插件根目录下的入口：
 

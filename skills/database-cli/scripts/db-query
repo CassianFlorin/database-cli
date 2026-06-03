@@ -279,6 +279,17 @@ def build_search_objects_sql(env, args):
                 f"{where_clause(clauses)} "
                 "ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
             )
+        if object_type == "procedure":
+            clauses = [f"ROUTINE_NAME LIKE {sql_literal(pattern)}"]
+            append_filter(clauses, "ROUTINE_SCHEMA", schema_filter)
+            return (
+                "SELECT ROUTINE_SCHEMA AS routine_schema, ROUTINE_NAME AS routine_name, "
+                "ROUTINE_TYPE AS routine_type, DATA_TYPE AS data_type, CREATED AS created, "
+                "LAST_ALTERED AS last_altered "
+                "FROM INFORMATION_SCHEMA.ROUTINES"
+                f"{where_clause(clauses)} "
+                "ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME"
+            )
 
     if object_type == "schema":
         clauses = [f"schema_name LIKE {sql_literal(pattern)}"]
@@ -317,6 +328,15 @@ def build_search_objects_sql(env, args):
             "FROM pg_catalog.pg_indexes"
             f"{where_clause(clauses)} "
             "ORDER BY schemaname, tablename, indexname"
+        )
+    if object_type == "procedure":
+        clauses = [f"routine_name LIKE {sql_literal(pattern)}"]
+        append_filter(clauses, "routine_schema", schema_filter)
+        return (
+            "SELECT routine_schema, routine_name, routine_type, data_type "
+            "FROM information_schema.routines"
+            f"{where_clause(clauses)} "
+            "ORDER BY routine_schema, routine_name"
         )
 
     raise ConfigError(f"Unsupported object type '{object_type}'.")
@@ -682,8 +702,8 @@ def parse_args():
     parser.add_argument("--sql", help="Read-only SQL statement to execute.")
     parser.add_argument("--check-sql", help="Validate SQL safety without executing.")
     parser.add_argument("--inspect", nargs="?", const="", help="Inspect a source or table.")
-    parser.add_argument("--search-objects", help="Search schema/table/column/index metadata with a SQL LIKE pattern.")
-    parser.add_argument("--object-type", choices=["schema", "table", "column", "index"], default="table")
+    parser.add_argument("--search-objects", help="Search schema/table/column/index/procedure metadata with a SQL LIKE pattern.")
+    parser.add_argument("--object-type", choices=["schema", "table", "column", "index", "procedure"], default="table")
     parser.add_argument("--table", help="Limit column/index metadata search to one table.")
     parser.add_argument("--list-envs", action="store_true", help="List configured environments.")
     parser.add_argument("--format", choices=["json", "csv", "markdown", "text", "yaml"], default="json")

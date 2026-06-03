@@ -38,6 +38,32 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("query_readonly", tool_names)
         self.assertIn("search_objects", tool_names)
 
+        search_tool = next(tool for tool in responses[1]["result"]["tools"] if tool["name"] == "search_objects")
+        object_types = search_tool["inputSchema"]["properties"]["object_type"]["enum"]
+        self.assertIn("procedure", object_types)
+
+    def test_tool_call_returns_structured_output(self):
+        responses = self.call_server(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "check_sql",
+                        "arguments": {"sql": "SELECT 1"},
+                    },
+                }
+            ]
+        )
+
+        result = responses[0]["result"]
+        self.assertIn("structuredContent", result)
+        self.assertEqual(result["structuredContent"]["exit_code"], 0)
+        self.assertEqual(result["structuredContent"]["stderr"], "")
+        self.assertEqual(result["structuredContent"]["stdout"], "SELECT 1 LIMIT 200")
+        self.assertEqual(result["content"][0]["text"], "SELECT 1 LIMIT 200")
+
 
 if __name__ == "__main__":
     unittest.main()

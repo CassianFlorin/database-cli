@@ -1,6 +1,6 @@
 ---
 name: database-cli
-description: "Use when Codex needs to inspect database schema, search schema/table/column/index metadata, run safe read-only SQL, compare records across environments, or produce human-reviewed repair SQL through a local command-line or MCP workflow. This skill uses database-cli wrappers over local database tools and enforces read-only safety: never mutate database data directly; output repair SQL for humans to execute when changes are required."
+description: "Use when Codex needs to inspect database schema, search schema/table/column/index/procedure metadata, run safe read-only SQL, compare records across environments, or produce human-reviewed repair SQL through a local command-line or MCP workflow. This skill uses database-cli wrappers over local database tools and enforces read-only safety: never mutate database data directly; output repair SQL for humans to execute when changes are required."
 ---
 
 # Database CLI
@@ -73,6 +73,7 @@ scripts/db-query --env qa01 --inspect table_name
 scripts/db-query --env qa01 --search-objects "%cc_order%" --object-type table
 scripts/db-query --env qa01 --search-objects "%order_no%" --object-type column --table cc_order
 scripts/db-query --env qa01 --search-objects "%idx_order%" --object-type index --table cc_order
+scripts/db-query --env qa01 --search-objects "%sync_order%" --object-type procedure
 ```
 
 5. For data lookup, run a bounded read-only query:
@@ -91,7 +92,7 @@ When a client supports custom MCP servers, point it at:
 scripts/database-mcp
 ```
 
-The server exposes `list_envs`, `query_readonly`, `inspect`, `search_objects`, and `check_sql`. Use it when you want Agent-native structured calls without installing DBHub.
+The server exposes `list_envs`, `query_readonly`, `inspect`, `search_objects`, and `check_sql`. `search_objects` supports schema, table, column, index, and procedure metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it when you want Agent-native structured calls without installing DBHub.
 
 ## Useful Commands
 

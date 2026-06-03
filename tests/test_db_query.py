@@ -10,22 +10,23 @@ DB_QUERY = ROOT / "scripts" / "db-query"
 
 
 class DbQueryTest(unittest.TestCase):
+    def write_config(self, tmpdir, env):
+        config = Path(tmpdir) / "connections.local.json"
+        config.write_text(
+            json.dumps({"environments": {"qa01": env}}),
+            encoding="utf-8",
+        )
+        return config
+
     def test_prints_mysql_column_search_command(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            config = Path(tmpdir) / "connections.local.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "environments": {
-                            "qa01": {
-                                "driver": "mysql",
-                                "host": "mysql-qa01.example.internal",
-                                "username": "readonly_user",
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
+            config = self.write_config(
+                tmpdir,
+                {
+                    "driver": "mysql",
+                    "host": "mysql-qa01.example.internal",
+                    "username": "readonly_user",
+                },
             )
 
             result = subprocess.run(
@@ -53,6 +54,44 @@ class DbQueryTest(unittest.TestCase):
             self.assertIn("%order_no%", result.stdout)
             self.assertIn("TABLE_NAME =", result.stdout)
             self.assertIn("cc_order", result.stdout)
+            self.assertIn("LIMIT 200", result.stdout)
+
+    def test_prints_mysql_procedure_search_command(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(
+                tmpdir,
+                {
+                    "driver": "mysql",
+                    "host": "mysql-qa01.example.internal",
+                    "username": "readonly_user",
+                },
+            )
+
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--config",
+                    str(config),
+                    "--env",
+                    "qa01",
+                    "--search-objects",
+                    "%sync_order%",
+                    "--object-type",
+                    "procedure",
+                    "--schema",
+                    "qnvip_center_commerce",
+                    "--print-command",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertIn("INFORMATION_SCHEMA.ROUTINES", result.stdout)
+            self.assertIn("ROUTINE_NAME LIKE", result.stdout)
+            self.assertIn("%sync_order%", result.stdout)
+            self.assertIn("ROUTINE_SCHEMA =", result.stdout)
+            self.assertIn("qnvip_center_commerce", result.stdout)
             self.assertIn("LIMIT 200", result.stdout)
 
 

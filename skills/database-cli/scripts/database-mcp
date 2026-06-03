@@ -7,7 +7,7 @@ from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 DB_QUERY = SKILL_ROOT / "scripts" / "db-query"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 
 def tool_schema():
@@ -62,14 +62,14 @@ def tool_schema():
         },
         {
             "name": "search_objects",
-            "description": "Search schema/table/column/index metadata with a SQL LIKE pattern.",
+            "description": "Search schema/table/column/index/procedure metadata with a SQL LIKE pattern.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "config": common_config,
                     "env": env,
                     "pattern": {"type": "string", "description": "SQL LIKE pattern, e.g. %order_no%."},
-                    "object_type": {"type": "string", "enum": ["schema", "table", "column", "index"]},
+                    "object_type": {"type": "string", "enum": ["schema", "table", "column", "index", "procedure"]},
                     "schema": {"type": "string", "description": "Optional schema/database filter."},
                     "table": {"type": "string", "description": "Optional table filter for column/index search."},
                     "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
@@ -150,8 +150,19 @@ def run_tool(name, args):
     text = proc.stdout
     if proc.stderr:
         text = text + ("\n" if text else "") + proc.stderr
+    structured = {
+        "exit_code": proc.returncode,
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+    }
+    if proc.stdout.strip():
+        try:
+            structured["json"] = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            pass
     return {
         "content": [{"type": "text", "text": text.strip()}],
+        "structuredContent": structured,
         "isError": proc.returncode != 0,
     }
 
