@@ -1,0 +1,6 @@
+interface:
+  display_name: "Database CLI"
+  short_description: "Read-only database access via local CLI"
+  default_prompt: "Use $database-cli to inspect database schema or run a safe read-only SQL query through the local CLI."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,5 @@
+connections.local.json
+**/connections.local.json
+.DS_Store
+*.log
+__pycache__/

@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import quote, urlencode
+
+
+DEFAULT_LIMIT = 200
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG_PATHS = [
+    SKILL_ROOT / "connections.local.json",
+    Path.cwd() / "connections.local.json",
+    Path.home() / ".config" / "database-cli" / "connections.json",
+]
+
+ALLOWED_FIRST_TOKENS = {"select", "show", "desc", "describe", "explain", "with"}
+FORBIDDEN_KEYWORDS = {
+    "alter",
+    "begin",
+    "call",
+    "commit",
+    "copy",
+    "create",
+    "delete",
+    "drop",
+    "exec",
+    "execute",
+    "grant",
+    "insert",
+    "load",
+    "lock",
+    "merge",
+    "replace",
+    "revoke",
+    "rollback",
+    "set",
+    "truncate",
+    "unlock",
+    "update",
+}
+FORBIDDEN_PATTERNS = [
+    re.compile(r"\bfor\s+update\b", re.I),
+    re.compile(r"\binto\s+out(?:file|file)\b", re.I),
+    re.compile(r"\binto\s+dumpfile\b", re.I),
+    re.compile(r"\b(nextval|setval|get_lock|release_lock|sleep|pg_sleep|benchmark|dblink_exec)\s*\(", re.I),
+]
+
+
+class ConfigError(Exception):
+    pass
+
+
+class UnsafeSqlError(Exception):
+    pass
+
+
+def strip_comments_and_literals(sql):
+    out = []
+    i = 0
+    state = "normal"
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+
+        if state == "normal":
+            if ch == "-" and nxt == "-":
+                state = "line_comment"
+                out.append("  ")
+                i += 2
+                continue
+            if ch == "#":
+                state = "line_comment"
+                out.append(" ")
+                i += 1
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block_comment"
+                out.append("  ")
+                i += 2
+                continue
+            if ch == "'":
+                state = "single"
+                out.append(" ")
+                i += 1
+                continue
+            if ch == '"':
+                state = "double"
+                out.append(" ")
+                i += 1
+                continue
+            if ch == "`":
+                state = "backtick"
+                out.append(" ")
+                i += 1
+                continue
+            if ch == "[":
+                state = "bracket"
+                out.append(" ")
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+
+        if state == "line_comment":
+            if ch in "\r\n":
+                state = "normal"
+                out.append(ch)
+            else:
+                out.append(" ")
+            i += 1
+            continue
+
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "normal"
+                out.append("  ")
+                i += 2
+            else:
+                out.append("\n" if ch in "\r\n" else " ")
+                i += 1
+            continue
+
+        if state == "single":
+            if ch == "'" and nxt == "'":
+                out.append("  ")
+                i += 2
+                continue
+            if ch == "'":
+                state = "normal"
+            out.append(" ")
+            i += 1
+            continue
+
+        if state == "double":
+            if ch == '"' and nxt == '"':
+                out.append("  ")
+                i += 2
+                continue
+            if ch == '"':
+                state = "normal"
+            out.append(" ")
+            i += 1
+            continue
+
+        if state == "backtick":
+            if ch == "`":
+                state = "normal"
+            out.append(" ")
+            i += 1
+            continue
+
+        if state == "bracket":
+            if ch == "]":
+                state = "normal"
+            out.append(" ")
+            i += 1
+            continue
+
+    return "".join(out)
+
+
+def nonempty_statements(cleaned_sql):
+    return [part.strip() for part in cleaned_sql.split(";") if part.strip()]
+
+
+def first_token(cleaned_sql):
+    match = re.search(r"[A-Za-z_][A-Za-z0-9_]*", cleaned_sql)
+    return match.group(0).lower() if match else ""
+
+
+def validate_sql(sql):
+    cleaned = strip_comments_and_literals(sql)
+    statements = nonempty_statements(cleaned)
+    if len(statements) != 1:
+        raise UnsafeSqlError("SQL must contain exactly one statement.")
+
+    statement = statements[0]
+    token = first_token(statement)
+    if token not in ALLOWED_FIRST_TOKENS:
+        allowed = ", ".join(sorted(ALLOWED_FIRST_TOKENS))
+        raise UnsafeSqlError(f"SQL must start with a read-only token: {allowed}.")
+
+    words = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", statement.lower()))
+    blocked = sorted(words & FORBIDDEN_KEYWORDS)
+    if blocked:
+        raise UnsafeSqlError(f"SQL contains blocked keyword(s): {', '.join(blocked)}.")
+
+    for pattern in FORBIDDEN_PATTERNS:
+        if pattern.search(statement):
+            raise UnsafeSqlError(f"SQL contains blocked pattern: {pattern.pattern}.")
+
+    return statement, token
+
+
+def maybe_add_limit(sql, token, limit, limit_style, no_auto_limit):
+    if no_auto_limit or limit <= 0 or limit_style == "none":
+        return sql.strip().rstrip(";")
+    if token not in {"select", "with"}:
+        return sql.strip().rstrip(";")
+
+    cleaned = strip_comments_and_literals(sql)
+    if re.search(r"\blimit\b|\bfetch\s+first\b|\btop\b", cleaned, re.I):
+        return sql.strip().rstrip(";")
+    return f"{sql.strip().rstrip(';')} LIMIT {limit}"
+
+
+def config_paths(explicit_path):
+    if explicit_path:
+        return [Path(explicit_path).expanduser()]
+    env_path = os.environ.get("DATABASE_CLI_CONFIG")
+    if env_path:
+        return [Path(env_path).expanduser()]
+    return DEFAULT_CONFIG_PATHS
+
+
+def load_config(explicit_path):
+    for path in config_paths(explicit_path):
+        if path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle), path
+    paths = ", ".join(str(path) for path in config_paths(explicit_path))
+    raise ConfigError(f"No config file found. Checked: {paths}")
+
+
+def get_env(config, env_name):
+    envs = config.get("environments", {})
+    if env_name not in envs:
+        available = ", ".join(sorted(envs)) or "(none)"
+        raise ConfigError(f"Unknown environment '{env_name}'. Available: {available}")
+    env = envs[env_name]
+    if not env.get("source") and not env.get("driver"):
+        raise ConfigError(
+            f"Environment '{env_name}' must define either 'source' or direct connection fields."
+        )
+    return env
+
+
+def env_value(env, *names):
+    for name in names:
+        if name in env and env[name] not in (None, ""):
+            return str(env[name])
+    return ""
+
+
+def password_value(env):
+    if env.get("password_env"):
+        env_name = str(env["password_env"])
+        password = os.environ.get(env_name)
+        if password is None:
+            raise ConfigError(f"Password environment variable '{env_name}' is not set.")
+        return password
+    return env_value(env, "password", "pass")
+
+
+def build_auth(username, password, include_password=True):
+    if not username:
+        return ""
+    auth = quote(username, safe="")
+    if password and include_password:
+        auth += f":{quote(password, safe='')}"
+    return f"{auth}@"
+
+
+MYSQL_PARAM_KEYS = {
+    "allowAllFiles",
+    "allowCleartextPasswords",
+    "allowFallbackToPlaintext",
+    "allowNativePasswords",
+    "allowOldPasswords",
+    "charset",
+    "checkConnLiveness",
+    "clientFoundRows",
+    "collation",
+    "columnsWithAlias",
+    "compress",
+    "interpolateParams",
+    "loc",
+    "maxAllowedPacket",
+    "multiStatements",
+    "parseTime",
+    "readTimeout",
+    "rejectReadOnly",
+    "serverPubKey",
+    "timeout",
+    "timeTruncate",
+    "tls",
+    "writeTimeout",
+}
+
+POSTGRES_PARAM_KEYS = {
+    "application_name",
+    "connect_timeout",
+    "fallback_application_name",
+    "gssencmode",
+    "krbsrvname",
+    "options",
+    "passfile",
+    "requirepeer",
+    "service",
+    "sslcert",
+    "sslcompression",
+    "sslcrl",
+    "sslkey",
+    "sslmode",
+    "sslrootcert",
+    "target_session_attrs",
+}
+
+
+def filter_params(driver, params):
+    if driver in {"mysql", "mariadb"}:
+        return {key: value for key, value in params.items() if key in MYSQL_PARAM_KEYS}
+    if driver in {"postgres", "postgresql"}:
+        return {key: value for key, value in params.items() if key in POSTGRES_PARAM_KEYS}
+    return params
+
+
+def build_params(env, driver):
+    params = dict(env.get("params", {}))
+    for key in ("sslmode", "ssl-mode", "charset", "timezone"):
+        if env.get(key):
+            params[key] = env[key]
+    params = filter_params(driver, params)
+    return f"?{urlencode(params)}" if params else ""
+
+
+def host_port(host, port):
+    return f"{host}:{port}" if port else host
+
+
+def build_direct_dsn(env, include_password=True):
+    driver = env_value(env, "driver", "type").lower()
+    database = env_value(env, "database", "db")
+    path = env_value(env, "path", "file")
+    username = env_value(env, "username", "user")
+    password = password_value(env)
+    params = build_params(env, driver)
+
+    if driver in {"sqlite", "sqlite3"}:
+        if not path and not database:
+            raise ConfigError("SQLite config requires 'path' or 'database'.")
+        sqlite_path = quote(path or database, safe="/:")
+        return f"sqlite3:///{sqlite_path}{params}"
+
+    if driver == "duckdb":
+        if not path and not database:
+            raise ConfigError("DuckDB config requires 'path' or 'database'.")
+        duckdb_path = quote(path or database, safe="/:")
+        return f"duckdb:///{duckdb_path}{params}"
+
+    if driver in {"mysql", "mariadb"}:
+        host = env_value(env, "host")
+        port = env_value(env, "port")
+        if not host:
+            raise ConfigError("MySQL config requires 'host'.")
+        path = f"/{quote(database, safe='')}" if database else ""
+        return f"mysql://{build_auth(username, password, include_password)}{host_port(host, port)}{path}{params}"
+
+    if driver in {"postgres", "postgresql"}:
+        host = env_value(env, "host")
+        port = env_value(env, "port")
+        if not host:
+            raise ConfigError("Postgres config requires 'host'.")
+        path = f"/{quote(database, safe='')}" if database else ""
+        return f"postgres://{build_auth(username, password, include_password)}{host_port(host, port)}{path}{params}"
+
+    if driver == "sqlserver":
+        host = env_value(env, "host")
+        port = env_value(env, "port")
+        if not host:
+            raise ConfigError("SQL Server config requires 'host'.")
+        query = dict(env.get("params", {}))
+        if database:
+            query.setdefault("database", database)
+        query_string = f"?{urlencode(query)}" if query else ""
+        return f"sqlserver://{build_auth(username, password, include_password)}{host_port(host, port)}{query_string}"
+
+    if driver == "clickhouse":
+        host = env_value(env, "host")
+        port = env_value(env, "port")
+        if not host:
+            raise ConfigError("ClickHouse config requires 'host'.")
+        path = f"/{quote(database, safe='')}" if database else ""
+        return f"clickhouse://{build_auth(username, password, include_password)}{host_port(host, port)}{path}{params}"
+
+    raise ConfigError(f"Unsupported direct driver '{driver}'. Use source for custom sq handles.")
+
+
+def redact(text, secrets):
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "***")
+    return redacted
+
+
+def env_secrets(env):
+    return [password_value(env)]
+
+
+def source_handle_for(env_name):
+    suffix = re.sub(r"[^A-Za-z0-9_]+", "_", env_name).strip("_") or "default"
+    return f"@database_cli_{suffix}"
+
+
+def output_flags(fmt):
+    return {
+        "json": ["--json", "--compact"],
+        "csv": ["--csv"],
+        "markdown": ["--markdown"],
+        "text": ["--text"],
+        "yaml": ["--yaml"],
+    }[fmt]
+
+
+def base_sq_command(args, config, env, require_executable=True, sq_config_override=None):
+    sq_bin = args.sq_bin
+    if require_executable and not shutil.which(sq_bin):
+        raise ConfigError(f"Missing '{sq_bin}' executable. Install with: brew install sq")
+
+    cmd = [sq_bin]
+    sq_config = sq_config_override or env.get("sq_config") or config.get("sq_config")
+    if sq_config:
+        cmd.extend(["--config", sq_config])
+    cmd.extend(["--no-progress", "--error.format", "text"])
+    return cmd
+
+
+def build_sql_command(args, config, env, sql, source, sq_config_override=None):
+    cmd = base_sq_command(
+        args,
+        config,
+        env,
+        require_executable=not args.print_command,
+        sq_config_override=sq_config_override,
+    )
+    cmd.append("sql")
+    cmd.extend(["--src", source])
+    schema = args.schema or env.get("schema")
+    if schema:
+        cmd.extend(["--src.schema", schema])
+    cmd.extend(output_flags(args.format))
+    cmd.append(sql)
+    return cmd
+
+
+def build_inspect_command(args, config, env, source, sq_config_override=None):
+    cmd = base_sq_command(
+        args,
+        config,
+        env,
+        require_executable=not args.print_command,
+        sq_config_override=sq_config_override,
+    )
+    cmd.append("inspect")
+    cmd.extend(output_flags(args.format))
+    schema = args.schema or env.get("schema")
+    if schema:
+        cmd.extend(["--src.schema", schema])
+    target = args.inspect
+    if target:
+        if target.startswith("@") or target.startswith("."):
+            cmd.append(target)
+        else:
+            cmd.append(f"{source}.{target}")
+    else:
+        cmd.append(source)
+    return cmd
+
+
+def run_command(cmd, timeout, secrets=None):
+    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    secrets = secrets or []
+    if proc.stdout:
+        sys.stdout.write(redact(proc.stdout, secrets))
+    if proc.stderr:
+        sys.stderr.write(redact(proc.stderr, secrets))
+    return proc.returncode
+
+
+def run_internal_command(cmd, timeout, secrets, input_text=None):
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        input=input_text,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        if proc.stdout:
+            sys.stderr.write(redact(proc.stdout, secrets))
+        if proc.stderr:
+            sys.stderr.write(redact(proc.stderr, secrets))
+    return proc.returncode
+
+
+def prepare_source(args, config, env, env_name):
+    if env.get("source"):
+        return env["source"], None, None
+
+    if not shutil.which(args.sq_bin) and not args.print_command:
+        raise ConfigError(f"Missing '{args.sq_bin}' executable. Install with: brew install sq")
+
+    password = password_value(env)
+    dsn = build_direct_dsn(env, include_password=args.print_command)
+    handle = source_handle_for(env_name)
+
+    if args.print_command:
+        prefix = ""
+        add_dsn = dsn
+        if password:
+            add_dsn = build_direct_dsn(env, include_password=False)
+            prefix = "printf '***\\n' | "
+        add_cmd = [
+            args.sq_bin,
+            "--config",
+            "<temporary-sq-config>",
+            "--no-progress",
+            "--error.format",
+            "text",
+            "add",
+            dsn,
+            "--handle",
+            handle,
+        ]
+        if password:
+            add_cmd[-3] = add_dsn
+            add_cmd.append("--password")
+            return handle, "<temporary-sq-config>", (prefix, add_cmd)
+        return handle, "<temporary-sq-config>", add_cmd
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="database-cli-sq-")
+    sq_config = str(Path(tmpdir.name) / "sq.yml")
+    add_dsn = build_direct_dsn(env, include_password=False if password else True)
+    add_cmd = [
+        args.sq_bin,
+        "--config",
+        sq_config,
+        "--no-progress",
+        "--error.format",
+        "text",
+        "add",
+        add_dsn,
+        "--handle",
+        handle,
+    ]
+    input_text = None
+    if password:
+        add_cmd.append("--password")
+        input_text = f"{password}\n"
+    rc = run_internal_command(add_cmd, args.timeout, env_secrets(env), input_text=input_text)
+    if rc != 0:
+        tmpdir.cleanup()
+        raise ConfigError(f"Failed to create temporary sq source for environment '{env_name}'.")
+    return handle, sq_config, tmpdir
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run safe read-only database CLI queries through sq.")
+    parser.add_argument("--config", help="Path to connections JSON.")
+    parser.add_argument("--env", help="Configured environment name.")
+    parser.add_argument("--schema", help="Override schema/catalog for this call.")
+    parser.add_argument("--sql", help="Read-only SQL statement to execute.")
+    parser.add_argument("--check-sql", help="Validate SQL safety without executing.")
+    parser.add_argument("--inspect", nargs="?", const="", help="Inspect a source or table.")
+    parser.add_argument("--list-envs", action="store_true", help="List configured environments.")
+    parser.add_argument("--format", choices=["json", "csv", "markdown", "text", "yaml"], default="json")
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Default row limit for SELECT/WITH queries.")
+    parser.add_argument("--no-auto-limit", action="store_true", help="Do not append LIMIT to SELECT/WITH queries.")
+    parser.add_argument("--print-command", action="store_true", help="Print the sq command instead of executing it.")
+    parser.add_argument("--sq-bin", default="sq", help="sq executable path or name.")
+    parser.add_argument("--timeout", type=int, default=60, help="Command timeout in seconds.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    try:
+        if args.check_sql:
+            _, token = validate_sql(args.check_sql)
+            limited = maybe_add_limit(args.check_sql, token, args.limit, "limit", args.no_auto_limit)
+            print(limited)
+            return 0
+
+        config, path = load_config(args.config)
+
+        if args.list_envs:
+            envs = config.get("environments", {})
+            print(json.dumps({"config": str(path), "environments": sorted(envs)}, ensure_ascii=False))
+            return 0
+
+        if not args.env:
+            raise ConfigError("Missing --env. Use --list-envs to see configured environments.")
+
+        env = get_env(config, args.env)
+
+        if args.sql:
+            _, token = validate_sql(args.sql)
+            sql = maybe_add_limit(
+                args.sql,
+                token,
+                args.limit,
+                env.get("limit_style", "limit"),
+                args.no_auto_limit,
+            )
+            source, sq_config, setup = prepare_source(args, config, env, args.env)
+            cmd = build_sql_command(args, config, env, sql, source, sq_config)
+        elif args.inspect is not None:
+            source, sq_config, setup = prepare_source(args, config, env, args.env)
+            cmd = build_inspect_command(args, config, env, source, sq_config)
+        else:
+            raise ConfigError("Provide --sql, --inspect, --list-envs, or --check-sql.")
+
+        if args.print_command:
+            if isinstance(setup, tuple):
+                prefix, setup_cmd = setup
+                print(prefix + redact(shlex.join(setup_cmd), env_secrets(env)))
+                print("&&")
+            elif isinstance(setup, list):
+                print(redact(shlex.join(setup), env_secrets(env)))
+                print("&&")
+            print(shlex.join(cmd))
+            return 0
+
+        try:
+            return run_command(cmd, args.timeout, env_secrets(env))
+        finally:
+            if isinstance(setup, tempfile.TemporaryDirectory):
+                setup.cleanup()
+    except (ConfigError, UnsafeSqlError, subprocess.TimeoutExpired) as exc:
+        print(f"db-query: {exc}", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError as exc:
+        print(f"db-query: invalid config JSON: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

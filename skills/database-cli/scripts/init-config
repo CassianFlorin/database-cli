@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+import argparse
+import getpass
+import json
+import os
+import sys
+from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlparse
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
+    tomllib = None
+
+
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+
+
+def prompt(label, default="", secret=False, required=False):
+    suffix = f" [{default}]" if default else ""
+    while True:
+        if secret:
+            value = getpass.getpass(f"{label}{suffix}: ")
+        else:
+            value = input(f"{label}{suffix}: ")
+        value = value.strip() or default
+        if value or not required:
+            return value
+        print(f"{label} is required.", file=sys.stderr)
+
+
+def prompt_bool(label, default=False):
+    default_text = "Y/n" if default else "y/N"
+    value = input(f"{label} [{default_text}]: ").strip().lower()
+    if not value:
+        return default
+    return value in {"y", "yes"}
+
+
+def load_existing(path):
+    if not path.exists():
+        return {"environments": {}}
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    data.setdefault("environments", {})
+    return data
+
+
+def load_toml(path):
+    if tomllib is None:
+        raise ValueError("Python tomllib is unavailable; use Python 3.11+ or install tomli")
+    with path.open("rb") as handle:
+        return tomllib.load(handle)
+
+
+def env_from_dsn(dsn):
+    parsed = urlparse(dsn)
+    driver = parsed.scheme.lower()
+    if driver == "postgresql":
+        driver = "postgres"
+    if not driver:
+        raise ValueError("DSN is missing a driver scheme")
+
+    env = {"driver": driver, "limit_style": "limit"}
+    if driver in {"sqlite", "sqlite3", "duckdb"}:
+        path = unquote(parsed.path or "")
+        if path.startswith("/") and not path.startswith("//"):
+            path = path[1:]
+        env["path"] = path
+        env["database"] = path
+    else:
+        if not parsed.hostname:
+            raise ValueError("DSN is missing a host")
+        env["host"] = parsed.hostname
+        if parsed.port is not None:
+            env["port"] = parsed.port
+        if parsed.username:
+            env["username"] = unquote(parsed.username)
+        if parsed.password:
+            env["password"] = unquote(parsed.password)
+        database = unquote(parsed.path.lstrip("/"))
+        if database:
+            env["database"] = database
+
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if params:
+        env["params"] = params
+    return env
+
+
+def import_dbhub_sources(args, config):
+    data = load_toml(Path(args.from_dbhub_toml).expanduser())
+    sources = data.get("sources", [])
+    if not isinstance(sources, list):
+        raise ValueError("DBHub TOML must contain a sources array")
+
+    imported = []
+    requested_env = args.env
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        env_name = source.get("id") or source.get("name")
+        dsn = source.get("dsn")
+        if not env_name or not dsn:
+            continue
+        if requested_env and env_name != requested_env:
+            continue
+        if env_name in config["environments"] and not args.force:
+            raise ValueError(f"environment '{env_name}' already exists; use --force to replace it")
+        config["environments"][env_name] = env_from_dsn(str(dsn))
+        imported.append(env_name)
+
+    if requested_env and not imported:
+        raise ValueError(f"environment '{requested_env}' was not found in DBHub TOML")
+    if not imported:
+        raise ValueError("no importable DBHub sources found")
+    return imported
+
+
+def build_env(args):
+    interactive = not args.non_interactive
+    env_name = args.env or (prompt("Environment name", "qa01", required=True) if interactive else "")
+    driver = (args.driver or (prompt("Driver", "mysql", required=True) if interactive else "")).lower()
+
+    env = {"driver": driver}
+
+    if driver in {"sqlite", "sqlite3", "duckdb"}:
+        path = args.path or (prompt("Database file path", required=True) if interactive else "")
+        if not path:
+            raise ValueError("path is required for sqlite3/duckdb")
+        env["path"] = path
+        env["database"] = args.database or path
+    else:
+        host = args.host or (prompt("Host", required=True) if interactive else "")
+        if not host:
+            raise ValueError("host is required")
+        env["host"] = host
+        port = args.port
+        if interactive and port is None:
+            port_text = prompt("Port (optional; leave blank when domain/proxy handles it)")
+            port = int(port_text) if port_text else None
+        if port is not None:
+            env["port"] = int(port)
+        database = args.database
+        if interactive and database is None:
+            database = prompt("Default database/catalog (optional)")
+        if database:
+            env["database"] = database
+        username = args.username or (prompt("Username", required=True) if interactive else "")
+        if username:
+            env["username"] = username
+
+        password_env = args.password_env
+        password = args.password
+        if interactive and not password_env and password is None:
+            use_env = prompt_bool("Use environment variable for password", default=True)
+            if use_env:
+                default_env = f"{env_name.upper().replace('-', '_')}_DB_PASSWORD"
+                password_env = prompt("Password env var name", default_env, required=True)
+            else:
+                password = prompt("Password", secret=True)
+        if password_env:
+            env["password_env"] = password_env
+        elif password:
+            env["password"] = password
+
+    schema = args.schema
+    if interactive and schema is None:
+        schema = prompt("Schema/catalog override (optional)")
+    if schema:
+        env["schema"] = schema
+
+    env["limit_style"] = args.limit_style
+    return env_name, env
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Create or update local database-cli connection config.")
+    parser.add_argument(
+        "--output",
+        default=str(SKILL_ROOT / "connections.local.json"),
+        help="Config file to write.",
+    )
+    parser.add_argument("--env", help="Environment name, e.g. qa01 or prod.")
+    parser.add_argument("--driver", choices=["mysql", "mariadb", "postgres", "postgresql", "sqlite3", "duckdb", "sqlserver", "clickhouse"])
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--database")
+    parser.add_argument("--path", help="SQLite/DuckDB file path.")
+    parser.add_argument("--username")
+    parser.add_argument("--password")
+    parser.add_argument("--password-env")
+    parser.add_argument("--schema")
+    parser.add_argument("--limit-style", default="limit", choices=["limit", "none"])
+    parser.add_argument("--force", action="store_true", help="Replace an existing environment entry.")
+    parser.add_argument("--non-interactive", action="store_true", help="Fail instead of prompting for missing fields.")
+    parser.add_argument("--from-dbhub-toml", help="Import one or all sources from a DBHub TOML file.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    output = Path(args.output).expanduser()
+
+    try:
+        config = load_existing(output)
+        if args.from_dbhub_toml:
+            imported = import_dbhub_sources(args, config)
+        else:
+            env_name, env = build_env(args)
+            if not env_name:
+                raise ValueError("--env is required in non-interactive mode")
+            if env_name in config["environments"] and not args.force:
+                raise ValueError(f"environment '{env_name}' already exists; use --force to replace it")
+            config["environments"][env_name] = env
+            imported = [env_name]
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.chmod(output, 0o600)
+
+        print(json.dumps({"written": str(output), "environments": imported}, ensure_ascii=False))
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"init-config: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+import argparse
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def prompt_bool(label, default=False):
+    default_text = "Y/n" if default else "y/N"
+    value = input(f"{label} [{default_text}]: ").strip().lower()
+    if not value:
+        return default
+    return value in {"y", "yes"}
+
+
+def run(cmd, cwd):
+    return subprocess.run(cmd, cwd=cwd, check=False).returncode
+
+
+def ensure_sq(skill_dir, install_sq):
+    if shutil.which("sq"):
+        print("sq found.")
+        return 0
+
+    print("sq is not installed. It is required for real database queries.")
+    if install_sq is None:
+        install_sq = bool(shutil.which("brew")) and prompt_bool("Install sq with Homebrew now", default=True)
+
+    if install_sq:
+        if not shutil.which("brew"):
+            print("Homebrew not found. Install sq manually: brew install sq", file=sys.stderr)
+            return 2
+        return run(["brew", "install", "sq"], skill_dir)
+
+    print("Skipped sq install. Install later with: brew install sq")
+    return 0
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Install/setup database-cli skill local prerequisites and config.")
+    parser.add_argument("--skip-sq-check", action="store_true", help="Do not check for sq.")
+    parser.add_argument("--install-sq", action="store_true", help="Install sq with Homebrew if missing.")
+    parser.add_argument("--no-install-sq", action="store_true", help="Do not install sq if missing.")
+    parser.add_argument("--skip-config", action="store_true", help="Do not prompt for database connection config.")
+    parser.add_argument("--force", action="store_true", help="Replace an existing environment entry.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    skill_dir = Path(__file__).resolve().parents[1]
+
+    install_sq = None
+    if args.install_sq:
+        install_sq = True
+    if args.no_install_sq:
+        install_sq = False
+
+    if not args.skip_sq_check:
+        rc = ensure_sq(skill_dir, install_sq)
+        if rc != 0:
+            return rc
+
+    if args.skip_config:
+        return 0
+
+    init_config = skill_dir / "scripts" / "init-config"
+    cmd = [str(init_config)]
+    if args.force:
+        cmd.append("--force")
+    return run(cmd, skill_dir)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

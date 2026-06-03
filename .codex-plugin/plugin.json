@@ -1,0 +1,38 @@
+{
+  "name": "database-cli",
+  "version": "0.1.0",
+  "description": "Read-only database investigation through local CLI tools, replacing DBHub MCP lookups with sq-backed commands.",
+  "author": {
+    "name": "Cassian Florin",
+    "url": "https://github.com/CassianFlorin"
+  },
+  "homepage": "https://github.com/CassianFlorin/database-cli",
+  "repository": "https://github.com/CassianFlorin/database-cli",
+  "license": "MIT",
+  "keywords": [
+    "database",
+    "sql",
+    "cli",
+    "sq",
+    "dbhub",
+    "read-only"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Database CLI",
+    "shortDescription": "Read-only SQL via local CLI",
+    "longDescription": "Use Database CLI to inspect database schema, run safe read-only SQL, compare records across environments, and produce human-reviewed repair SQL through local sq-backed commands.",
+    "developerName": "Cassian Florin",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Use Database CLI to inspect a database schema.",
+      "Use Database CLI to run a safe read-only SQL query."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

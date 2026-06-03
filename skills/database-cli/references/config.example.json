@@ -1,0 +1,18 @@
+{
+  "environments": {
+    "qa01": {
+      "driver": "mysql",
+      "host": "mysql-qa01.example.internal",
+      "username": "readonly_user",
+      "password": "replace-with-local-password",
+      "limit_style": "limit"
+    },
+    "prod": {
+      "driver": "mysql",
+      "host": "mysql-prod.example.internal",
+      "username": "readonly_user",
+      "password_env": "QNVIP_PROD_DB_PASSWORD",
+      "limit_style": "limit"
+    }
+  }
+}
