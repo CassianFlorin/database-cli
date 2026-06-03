@@ -1,6 +1,11 @@
 {
   "environments": {
     "qa01": {
+      "display_name": "QNVIP QA01",
+      "environment": "qa01",
+      "project": "qnvip",
+      "description": "Shared QA readonly connection; search all visible schemas unless narrowed.",
+      "aliases": ["qa-01", "test"],
       "driver": "mysql",
       "host": "mysql-qa01.example.internal",
       "username": "readonly_user",

@@ -32,6 +32,11 @@ For non-interactive setup:
 ```bash
 scripts/init-config \
   --env qa01 \
+  --display-name "QNVIP QA01" \
+  --environment qa01 \
+  --project qnvip \
+  --description "Shared QA readonly connection; search all visible schemas unless narrowed." \
+  --alias qa-01 \
   --driver mysql \
   --host mysql-qa01.example.internal \
   --username readonly_user \
@@ -44,6 +49,11 @@ The resulting `connections.local.json` uses direct database connection fields:
 {
   "environments": {
     "qa01": {
+      "display_name": "QNVIP QA01",
+      "environment": "qa01",
+      "project": "qnvip",
+      "description": "Shared QA readonly connection; search all visible schemas unless narrowed.",
+      "aliases": ["qa-01", "test"],
       "driver": "mysql",
       "host": "mysql-qa01.example.internal",
       "username": "readonly_user",
@@ -64,6 +74,11 @@ The resulting `connections.local.json` uses direct database connection fields:
 
 Fields:
 
+- `display_name`: Optional human-readable connection name shown by `--list-envs`.
+- `environment`: Optional environment label, such as `qa01`, `prod`, or `staging`.
+- `project`: Optional project or business domain, such as `qnvip`.
+- `description`: Optional guidance for humans and Agents about when to use this connection.
+- `aliases`: Optional list of extra names that resolve to this environment. For example, `qa-01` can resolve to `qa01`.
 - `driver`: Required for direct config. Supported direct drivers: `mysql`, `postgres`, `sqlite3`, `duckdb`, `sqlserver`, `clickhouse`.
 - `host`: Required for network databases.
 - `port`: Optional. If omitted, the DSN uses only the host/domain. This supports domains whose proxy already maps the database port.
@@ -139,7 +154,11 @@ If you already manage sources with `sq add`, the config can point to the existin
 
 When an environment uses direct fields, `scripts/db-query` builds a DSN, creates a temporary `sq` source, runs the read-only query or inspect command, then deletes the temporary config. It does not require the user to run `sq add` manually.
 
-The direct config is intentionally not database-scoped by default. The configured environment represents a database server/instance and authorization context. The user decides which database/schema/table to query by writing fully-qualified SQL.
+The direct config is intentionally not database-scoped by default. The configured environment represents a database server/instance and authorization context. Do not create one connection per database unless those databases require different hosts or credentials.
+
+For metadata discovery, omit `--schema` first so `scripts/db-query --search-objects` searches the schemas visible to the configured account. Add `--schema` only after the user narrows the target or the result set is too broad.
+
+For data lookup, use fully-qualified table names after discovery, such as `SELECT col FROM dbname.table_name WHERE ...`.
 
 When a password is configured, the wrapper does not place the password in the command-line DSN. It invokes `sq add --password` and passes the password on stdin.
 

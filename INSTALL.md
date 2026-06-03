@@ -33,10 +33,15 @@ scripts/install
 5. 向用户索取数据库连接信息：
 
 - 环境名，例如 `qa01`、`prod`
+- 展示名，例如 `QNVIP QA01`
+- 环境标签，例如 `qa01`、`prod`、`staging`
+- 项目或业务域，例如 `qnvip`
+- 用途说明，例如“QA01 共享只读连接，默认搜索账号可见库”
+- 可选别名，例如 `qa-01`
 - driver，例如 `mysql`
 - host 或域名
 - 可选端口；如果域名或代理已处理端口，留空
-- 可选默认 database/catalog
+- 可选默认 database/catalog；通常留空，不要为了每个 database 创建一个连接
 - 用户名
 - 密码或密码环境变量
 
@@ -69,6 +74,11 @@ printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | scripts/
 ```bash
 scripts/init-config \
   --env qa01 \
+  --display-name "QNVIP QA01" \
+  --environment qa01 \
+  --project qnvip \
+  --description "QA01 shared readonly connection; search all visible schemas unless narrowed." \
+  --alias qa-01 \
   --driver mysql \
   --host mysql-qa01.example.internal \
   --username readonly_user \

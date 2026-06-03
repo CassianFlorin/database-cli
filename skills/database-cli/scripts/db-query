@@ -473,15 +473,71 @@ def load_config(explicit_path):
 
 def get_env(config, env_name):
     envs = config.get("environments", {})
-    if env_name not in envs:
-        available = ", ".join(sorted(envs)) or "(none)"
-        raise ConfigError(f"Unknown environment '{env_name}'. Available: {available}")
-    env = envs[env_name]
+    canonical_name = resolve_env_name(config, env_name)
+    env = envs[canonical_name]
     if not env.get("source") and not env.get("driver"):
         raise ConfigError(
-            f"Environment '{env_name}' must define either 'source' or direct connection fields."
+            f"Environment '{canonical_name}' must define either 'source' or direct connection fields."
         )
-    return env
+    return canonical_name, env
+
+
+def alias_values(env):
+    aliases = env.get("aliases", [])
+    if isinstance(aliases, str):
+        return [aliases]
+    if isinstance(aliases, list):
+        return [str(alias) for alias in aliases if str(alias)]
+    return []
+
+
+def resolve_env_name(config, requested):
+    envs = config.get("environments", {})
+    if requested in envs:
+        return requested
+    matches = [
+        name
+        for name, env in envs.items()
+        if requested in alias_values(env)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    available = ", ".join(sorted(envs)) or "(none)"
+    if len(matches) > 1:
+        matched = ", ".join(sorted(matches))
+        raise ConfigError(f"Environment alias '{requested}' is ambiguous: {matched}. Available: {available}")
+    raise ConfigError(f"Unknown environment '{requested}'. Available: {available}")
+
+
+SAFE_CONNECTION_FIELDS = [
+    "display_name",
+    "environment",
+    "project",
+    "description",
+    "aliases",
+    "driver",
+    "type",
+    "host",
+    "port",
+    "database",
+    "schema",
+    "source",
+    "max_rows",
+    "readonly",
+    "limit_style",
+]
+
+
+def connection_summary(name, env):
+    summary = {"name": name}
+    for field in SAFE_CONNECTION_FIELDS:
+        if field in env and env[field] not in (None, ""):
+            summary[field] = env[field]
+    if "aliases" in summary:
+        summary["aliases"] = alias_values(env)
+    if "readonly" not in summary:
+        summary["readonly"] = True
+    return summary
 
 
 def bool_value(value, default=True):
@@ -875,14 +931,18 @@ def main():
 
         if args.list_envs:
             envs = config.get("environments", {})
-            print(json.dumps({"config": str(path), "environments": sorted(envs)}, ensure_ascii=False))
+            connections = [
+                connection_summary(name, envs[name])
+                for name in sorted(envs)
+            ]
+            print(json.dumps({"config": str(path), "environments": sorted(envs), "connections": connections}, ensure_ascii=False))
             return 0
 
         if not args.env:
             raise ConfigError("Missing --env. Use --list-envs to see configured environments.")
 
-        env = get_env(config, args.env)
-        enforce_readonly(config, env, args.env)
+        env_name, env = get_env(config, args.env)
+        enforce_readonly(config, env, env_name)
         max_rows = configured_max_rows(config, env)
 
         if args.sql:
@@ -895,7 +955,7 @@ def main():
                 args.no_auto_limit,
                 max_rows,
             )
-            source, sq_config, setup = prepare_source(args, config, env, args.env)
+            source, sq_config, setup = prepare_source(args, config, env, env_name)
             cmd = build_sql_command(args, config, env, sql, source, sq_config)
         elif args.search_objects:
             search_sql = build_search_objects_sql(env, args)
@@ -908,10 +968,10 @@ def main():
                 args.no_auto_limit,
                 max_rows,
             )
-            source, sq_config, setup = prepare_source(args, config, env, args.env)
+            source, sq_config, setup = prepare_source(args, config, env, env_name)
             cmd = build_sql_command(args, config, env, sql, source, sq_config)
         elif args.inspect is not None:
-            source, sq_config, setup = prepare_source(args, config, env, args.env)
+            source, sq_config, setup = prepare_source(args, config, env, env_name)
             cmd = build_inspect_command(args, config, env, source, sq_config)
         else:
             raise ConfigError("Provide --sql, --search-objects, --inspect, --list-envs, or --check-sql.")

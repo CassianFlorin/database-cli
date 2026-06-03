@@ -11,7 +11,8 @@ Use this skill for database-backed investigation through the local database CLI 
 
 ## Hard Rules
 
-- Confirm the target environment before querying. If the environment is missing or ambiguous, list configured environments and ask the user to choose.
+- Confirm the target environment/connection before querying. If the environment is missing or ambiguous, list configured environments and connection metadata, then ask the user to choose.
+- Do not require the user to preselect a database/schema. A configured environment represents a database server or account permission boundary, not one database. Search visible schema/table metadata first, then narrow with `--schema` only when needed.
 - Never execute database mutations through this skill in any environment.
 - Allow only `SELECT`, `SHOW`, `DESC`/`DESCRIBE`, `EXPLAIN`, and conservative read-only `WITH ... SELECT` queries.
 - Refuse SQL containing mutation, DDL, permission, transaction, procedure, lock, export, or side-effect keywords.
@@ -59,7 +60,7 @@ The initializer prompts for database server address/domain, optional port, usern
 
 ## Query Workflow
 
-1. Identify the environment, fully-qualified table names, and business keys from the user request.
+1. Identify the environment/connection and business keys from the user request. Treat configured aliases as valid environment names.
 2. Check configured environments:
 
 ```bash
@@ -73,7 +74,7 @@ scripts/db-query --env qa01 --inspect
 scripts/db-query --env qa01 --inspect table_name
 ```
 
-4. For object metadata search, use:
+4. For object metadata search, do not ask for a database first. Search all schemas visible to the configured account:
 
 ```bash
 scripts/db-query --env qa01 --search-objects "%cc_order%" --object-type table
@@ -81,6 +82,12 @@ scripts/db-query --env qa01 --search-objects "%order_no%" --object-type column -
 scripts/db-query --env qa01 --search-objects "%idx_order%" --object-type index --table cc_order
 scripts/db-query --env qa01 --search-objects "%sync_order%" --object-type procedure
 scripts/db-query --env qa01 --search-objects "%calc%" --object-type function --detail-level full
+```
+
+If results are too broad, then narrow with `--schema`:
+
+```bash
+scripts/db-query --env qa01 --schema qnvip_center_commerce --search-objects "%order_no%" --object-type column
 ```
 
 Use `--detail-level names` for quick discovery, `--detail-level summary` for normal investigation, and `--detail-level full` when comments, routine definitions, or index details matter.

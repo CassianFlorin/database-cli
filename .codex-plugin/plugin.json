@@ -1,7 +1,7 @@
 {
   "name": "database-cli",
-  "version": "0.3.0",
-  "description": "Read-only database investigation through local CLI and MCP commands.",
+  "version": "0.4.0",
+  "description": "CLI-first read-only database investigation Skill.",
   "author": {
     "name": "Cassian Florin",
     "url": "https://github.com/CassianFlorin"
@@ -21,8 +21,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Database CLI",
-    "shortDescription": "Read-only SQL via local CLI or MCP",
-    "longDescription": "Use Database CLI to inspect database schema, search metadata, run safe read-only SQL, compare records across environments, and produce human-reviewed repair SQL through local CLI or MCP commands.",
+    "shortDescription": "CLI-first database investigation Skill",
+    "longDescription": "Use Database CLI to inspect database schema, search metadata across visible schemas, run safe read-only SQL, compare records across environments, and produce human-reviewed repair SQL through the local CLI workflow. MCP is an optional adapter over the same CLI.",
     "developerName": "Cassian Florin",
     "category": "Productivity",
     "capabilities": [

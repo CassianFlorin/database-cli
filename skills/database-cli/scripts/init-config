@@ -47,6 +47,37 @@ def build_env(args):
 
     env = {"driver": driver}
 
+    display_name = args.display_name
+    if interactive and display_name is None:
+        display_name = prompt("Display name (optional)", env_name)
+    if display_name:
+        env["display_name"] = display_name
+
+    environment = args.environment
+    if interactive and environment is None:
+        environment = prompt("Environment label (optional)", env_name)
+    if environment:
+        env["environment"] = environment
+
+    project = args.project
+    if interactive and project is None:
+        project = prompt("Project/business domain (optional)")
+    if project:
+        env["project"] = project
+
+    description = args.description
+    if interactive and description is None:
+        description = prompt("Connection description (optional)")
+    if description:
+        env["description"] = description
+
+    aliases = list(args.aliases or [])
+    if interactive and not aliases:
+        aliases_text = prompt("Aliases (comma-separated, optional)")
+        aliases = [item.strip() for item in aliases_text.split(",") if item.strip()]
+    if aliases:
+        env["aliases"] = aliases
+
     if driver in {"sqlite", "sqlite3", "duckdb"}:
         path = args.path or (prompt("Database file path", required=True) if interactive else "")
         if not path:
@@ -93,6 +124,9 @@ def build_env(args):
     if schema:
         env["schema"] = schema
 
+    if args.max_rows is not None:
+        env["max_rows"] = args.max_rows
+
     env["limit_style"] = args.limit_style
     return env_name, env
 
@@ -105,6 +139,11 @@ def parse_args():
         help="Config file to write.",
     )
     parser.add_argument("--env", help="Environment name, e.g. qa01 or prod.")
+    parser.add_argument("--display-name", help="Human-readable connection name.")
+    parser.add_argument("--environment", help="Environment label, e.g. qa01, prod, staging.")
+    parser.add_argument("--project", help="Project or business domain this connection belongs to.")
+    parser.add_argument("--description", help="Short note describing when to use this connection.")
+    parser.add_argument("--alias", dest="aliases", action="append", help="Additional name that resolves to this environment. Repeatable.")
     parser.add_argument("--driver", choices=["mysql", "mariadb", "postgres", "postgresql", "sqlite3", "duckdb", "sqlserver", "clickhouse"])
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
@@ -114,6 +153,7 @@ def parse_args():
     parser.add_argument("--password")
     parser.add_argument("--password-env")
     parser.add_argument("--schema")
+    parser.add_argument("--max-rows", type=int, help="Hard maximum rows returned by read-only SELECT/WITH queries.")
     parser.add_argument("--limit-style", default="limit", choices=["limit", "none"])
     parser.add_argument("--force", action="store_true", help="Replace an existing environment entry.")
     parser.add_argument("--non-interactive", action="store_true", help="Fail instead of prompting for missing fields.")

@@ -24,6 +24,73 @@ class DbQueryTest(unittest.TestCase):
         )
         return config
 
+    def test_list_envs_includes_connection_metadata_without_secrets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(
+                tmpdir,
+                {
+                    "display_name": "QNVIP QA01",
+                    "environment": "qa01",
+                    "project": "qnvip",
+                    "description": "Shared QA readonly connection.",
+                    "aliases": ["qa-01", "test"],
+                    "driver": "mysql",
+                    "host": "mysql-qa01.example.internal",
+                    "username": "readonly_user",
+                    "password": "secret",
+                    "password_env": "QA01_DB_PASSWORD",
+                    "max_rows": 100,
+                },
+            )
+
+            result = subprocess.run(
+                [str(DB_QUERY), "--config", str(config), "--list-envs"],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            data = json.loads(result.stdout)
+            self.assertEqual(data["environments"], ["qa01"])
+            self.assertEqual(data["connections"][0]["name"], "qa01")
+            self.assertEqual(data["connections"][0]["display_name"], "QNVIP QA01")
+            self.assertEqual(data["connections"][0]["environment"], "qa01")
+            self.assertEqual(data["connections"][0]["project"], "qnvip")
+            self.assertEqual(data["connections"][0]["aliases"], ["qa-01", "test"])
+            self.assertEqual(data["connections"][0]["max_rows"], 100)
+            self.assertNotIn("password", json.dumps(data))
+            self.assertNotIn("QA01_DB_PASSWORD", json.dumps(data))
+
+    def test_env_alias_resolves_to_canonical_connection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(
+                tmpdir,
+                {
+                    "driver": "mysql",
+                    "host": "mysql-qa01.example.internal",
+                    "username": "readonly_user",
+                    "aliases": ["qa-01", "test"],
+                },
+            )
+
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--config",
+                    str(config),
+                    "--env",
+                    "qa-01",
+                    "--sql",
+                    "SELECT 1",
+                    "--print-command",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertIn("@database_cli_qa01", result.stdout)
+
     def test_prints_mysql_column_search_command(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self.write_config(
