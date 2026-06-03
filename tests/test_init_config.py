@@ -79,6 +79,40 @@ class InitConfigTest(unittest.TestCase):
                 },
             )
 
+    def test_non_interactive_database_url_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "connections.local.json"
+            subprocess.run(
+                [
+                    str(INIT_CONFIG),
+                    "--output",
+                    str(output),
+                    "--env",
+                    "qa03",
+                    "--url",
+                    "mysql://mysql-qa03.example.internal:3307/qnvip_center_order?charset=utf8mb4",
+                    "--username",
+                    "readonly_user",
+                    "--password",
+                    "local-secret",
+                    "--non-interactive",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            data = json.loads(output.read_text(encoding="utf-8"))
+            env = data["environments"]["qa03"]
+            self.assertEqual(env["driver"], "mysql")
+            self.assertEqual(env["host"], "mysql-qa03.example.internal")
+            self.assertEqual(env["port"], 3307)
+            self.assertEqual(env["database"], "qnvip_center_order")
+            self.assertEqual(env["username"], "readonly_user")
+            self.assertEqual(env["password"], "local-secret")
+            self.assertEqual(env["params"], {"charset": "utf8mb4"})
+            self.assertEqual(env["limit_style"], "limit")
+
 
 if __name__ == "__main__":
     unittest.main()

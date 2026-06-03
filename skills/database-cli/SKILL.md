@@ -42,6 +42,8 @@ brew install sq
 
 If no environments are configured, read `references/config.md` and ask the user to create a local `connections.local.json` with database server address/domain, optional port, username, and password or `password_env`. The default local config path is `skills/database-cli/connections.local.json` when using the plugin root wrapper. Do not invent hosts, credentials, or environment mappings.
 
+If the user is installing or adding a connection through an Agent and the connection details are missing, ask the user for the database URL or host, username, and either password or password environment variable. Do not guess connection URLs, usernames, passwords, or access scope.
+
 For first-run setup after installing the Skill, use the install entrypoint:
 
 ```bash
@@ -54,6 +56,12 @@ For config-only setup, use the initializer instead of hand-writing JSON:
 
 ```bash
 scripts/init-config
+```
+
+The initializer also accepts a user-provided database URL:
+
+```bash
+scripts/init-config --env qa01 --url "mysql://mysql-qa01.example.internal" --username readonly_user --password-env QA01_DB_PASSWORD
 ```
 
 The initializer prompts for database server address/domain, optional port, username, and password storage. Default database/schema is optional; the user can choose the concrete database/schema in SQL with fully-qualified names.
@@ -108,7 +116,7 @@ When a client needs MCP tools, point it at:
 scripts/database-mcp
 ```
 
-The adapter exposes `list_envs`, `query_readonly`, `inspect`, `search_objects`, and `check_sql`. `search_objects` supports schema, table, column, index, procedure, and function metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it only when Agent-native structured calls are useful; CLI remains the source of truth.
+The adapter exposes `add_connection`, `list_envs`, `query_readonly`, `inspect`, `search_objects`, and `check_sql`. `add_connection` writes config through the same initializer path and lets a running Agent add or update a connection without restart; subsequent tool calls read the updated config. `search_objects` supports schema, table, column, index, procedure, and function metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it only when Agent-native structured calls are useful; CLI remains the source of truth.
 
 If `connections.local.json` has a top-level `tools` object, `scripts/database-mcp` also exposes those parameterized read-only custom tools. Parameters are rendered as SQL literals and then passed through `scripts/db-query`, so the same read-only validator and `max_rows` cap still apply.
 
@@ -147,7 +155,7 @@ DATABASE_CLI_CONFIG=/path/to/connections.json scripts/db-query --list-envs
 Create or update local config non-interactively:
 
 ```bash
-scripts/init-config --env qa01 --driver mysql --host mysql-qa01.example.internal --username readonly_user --password-env QA01_DB_PASSWORD
+scripts/init-config --env qa01 --url "mysql://mysql-qa01.example.internal" --username readonly_user --password-env QA01_DB_PASSWORD
 ```
 
 ## Notes

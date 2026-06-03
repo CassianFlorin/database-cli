@@ -32,6 +32,7 @@ scripts/install
 
 5. 向用户索取数据库连接信息：
 
+- 连接链接或 host/domain，例如 `mysql://mysql-qa01.example.internal:3306/dbname`
 - 环境名，例如 `qa01`、`prod`
 - 展示名，例如 `QNVIP QA01`
 - 环境标签，例如 `qa01`、`prod`、`staging`
@@ -44,6 +45,8 @@ scripts/install
 - 可选默认 database/catalog；通常留空，不要为了每个 database 创建一个连接
 - 用户名
 - 密码或密码环境变量
+
+如果用户只给了部分信息，继续向用户询问缺失项。不要猜测连接链接、用户名、密码或访问范围。
 
 6. 生成配置后验证：
 
@@ -74,13 +77,12 @@ printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | scripts/
 ```bash
 scripts/init-config \
   --env qa01 \
+  --url "mysql://mysql-qa01.example.internal" \
   --display-name "QNVIP QA01" \
   --environment qa01 \
   --project qnvip \
   --description "QA01 shared readonly connection; search all visible schemas unless narrowed." \
   --alias qa-01 \
-  --driver mysql \
-  --host mysql-qa01.example.internal \
   --username readonly_user \
   --password-env QA01_DB_PASSWORD
 ```
@@ -95,6 +97,7 @@ scripts/db-query --list-envs
 
 - 只允许通过 `scripts/db-query` 查询；这是唯一真实执行入口。
 - 需要 Agent 结构化工具入口时，使用 `scripts/database-mcp`；它只是适配层，仍然委托 `scripts/db-query` 执行实际查询。
+- 运行中的 Agent 需要新增连接时，优先调用 MCP `add_connection` 工具；调用成功后无需重启 Agent，后续工具调用会读取新配置。
 - 不执行写 SQL。
 - 修数时只输出给人工执行的 SQL。
 - 不展示或提交明文密码。

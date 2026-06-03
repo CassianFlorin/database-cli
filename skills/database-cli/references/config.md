@@ -27,18 +27,27 @@ scripts/init-config
 
 The initializer writes `skills/database-cli/connections.local.json` with file mode `0600` when run through the plugin root wrapper. If run from inside `skills/database-cli`, it writes that same local config file.
 
+The initializer can accept either split fields or a user-provided database URL. Explicit flags override values parsed from the URL:
+
+```bash
+scripts/init-config \
+  --env qa01 \
+  --url "mysql://mysql-qa01.example.internal:3306/qnvip_center_order?charset=utf8mb4" \
+  --username readonly_user \
+  --password-env QA01_DB_PASSWORD
+```
+
 For non-interactive setup:
 
 ```bash
 scripts/init-config \
   --env qa01 \
+  --url "mysql://mysql-qa01.example.internal" \
   --display-name "QNVIP QA01" \
   --environment qa01 \
   --project qnvip \
   --description "Shared QA readonly connection; search all visible schemas unless narrowed." \
   --alias qa-01 \
-  --driver mysql \
-  --host mysql-qa01.example.internal \
   --username readonly_user \
   --password-env QA01_DB_PASSWORD
 ```
@@ -80,6 +89,7 @@ Fields:
 - `description`: Optional guidance for humans and Agents about when to use this connection.
 - `aliases`: Optional list of extra names that resolve to this environment. For example, `qa-01` can resolve to `qa01`.
 - `driver`: Required for direct config. Supported direct drivers: `mysql`, `postgres`, `sqlite3`, `duckdb`, `sqlserver`, `clickhouse`.
+- `url`: Initializer input only. Parses driver, host, port, database/path, username, password, and URL query params into the stored fields below. Prefer passing username/password separately when possible.
 - `host`: Required for network databases.
 - `port`: Optional. If omitted, the DSN uses only the host/domain. This supports domains whose proxy already maps the database port.
 - `database`: Optional for network databases. Use it only when the server requires a default catalog/database at login. Otherwise qualify tables in SQL, such as `SELECT col FROM dbname.schema.table` or `SELECT col FROM dbname.table`.
@@ -95,6 +105,23 @@ Fields:
 - `readonly`: Optional boolean. Only `true` or omitted is supported. `false` is rejected because this skill never executes write SQL.
 
 ## Optional MCP Custom Tools
+
+The MCP adapter also exposes `add_connection` for running Agents that need to add or update a connection without restart. It writes the same `connections.local.json` format via the initializer path, then later MCP tool calls read the updated file.
+
+Example `add_connection` arguments:
+
+```json
+{
+  "config": "/path/to/connections.local.json",
+  "env": "qa02",
+  "url": "mysql://mysql-qa02.example.internal:3306/qnvip_center_order",
+  "username": "readonly_user",
+  "password_env": "QA02_DB_PASSWORD",
+  "display_name": "QNVIP QA02",
+  "aliases": ["qa-02"],
+  "max_rows": 100
+}
+```
 
 Top-level `tools` entries expose optional parameterized read-only tools from `scripts/database-mcp`. This is an adapter convenience for MCP clients, not the core product model. The rendered SQL still goes through `scripts/db-query`, so CLI safety checks and `max_rows` remain authoritative.
 

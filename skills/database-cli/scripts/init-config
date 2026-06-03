@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlparse
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -40,10 +41,48 @@ def load_existing(path):
     return data
 
 
+def parse_database_url(raw_url):
+    if not raw_url:
+        return {}
+    if "://" not in raw_url:
+        return {"host": raw_url}
+
+    parsed = urlparse(raw_url)
+    values = {}
+    if parsed.scheme:
+        scheme = parsed.scheme.lower()
+        values["driver"] = "sqlite3" if scheme == "sqlite" else scheme
+    if parsed.hostname:
+        values["host"] = parsed.hostname
+    if parsed.port:
+        values["port"] = parsed.port
+    if parsed.username:
+        values["username"] = unquote(parsed.username)
+    if parsed.password:
+        values["password"] = unquote(parsed.password)
+
+    path = unquote(parsed.path.lstrip("/"))
+    if path:
+        if values.get("driver") in {"sqlite3", "duckdb"}:
+            values["path"] = unquote(parsed.path)
+        else:
+            values["database"] = path
+
+    params = {key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
+    if params:
+        values["params"] = params
+    return values
+
+
 def build_env(args):
     interactive = not args.non_interactive
+    url = args.url
+    if interactive and url is None:
+        url = prompt("Connection URL or host (optional)")
+    url_values = parse_database_url(url)
+
     env_name = args.env or (prompt("Environment name", "qa01", required=True) if interactive else "")
-    driver = (args.driver or (prompt("Driver", "mysql", required=True) if interactive else "")).lower()
+    driver = (args.driver or url_values.get("driver") or (prompt("Driver", "mysql", required=True) if interactive else "")).lower()
 
     env = {"driver": driver}
 
@@ -79,33 +118,35 @@ def build_env(args):
         env["aliases"] = aliases
 
     if driver in {"sqlite", "sqlite3", "duckdb"}:
-        path = args.path or (prompt("Database file path", required=True) if interactive else "")
+        path = args.path or url_values.get("path") or (prompt("Database file path", required=True) if interactive else "")
         if not path:
             raise ValueError("path is required for sqlite3/duckdb")
         env["path"] = path
-        env["database"] = args.database or path
+        env["database"] = args.database or url_values.get("database") or path
     else:
-        host = args.host or (prompt("Host", required=True) if interactive else "")
+        host = args.host or url_values.get("host") or (prompt("Host / domain", required=True) if interactive else "")
         if not host:
             raise ValueError("host is required")
         env["host"] = host
-        port = args.port
+        port = args.port if args.port is not None else url_values.get("port")
         if interactive and port is None:
             port_text = prompt("Port (optional; leave blank when domain/proxy handles it)")
             port = int(port_text) if port_text else None
         if port is not None:
             env["port"] = int(port)
         database = args.database
+        if database is None:
+            database = url_values.get("database")
         if interactive and database is None:
             database = prompt("Default database/catalog (optional)")
         if database:
             env["database"] = database
-        username = args.username or (prompt("Username", required=True) if interactive else "")
+        username = args.username or url_values.get("username") or (prompt("Username", required=True) if interactive else "")
         if username:
             env["username"] = username
 
         password_env = args.password_env
-        password = args.password
+        password = args.password if args.password is not None else url_values.get("password")
         if interactive and not password_env and password is None:
             use_env = prompt_bool("Use environment variable for password", default=True)
             if use_env:
@@ -117,6 +158,8 @@ def build_env(args):
             env["password_env"] = password_env
         elif password:
             env["password"] = password
+        if url_values.get("params"):
+            env["params"] = url_values["params"]
 
     schema = args.schema
     if interactive and schema is None:
@@ -139,6 +182,7 @@ def parse_args():
         help="Config file to write.",
     )
     parser.add_argument("--env", help="Environment name, e.g. qa01 or prod.")
+    parser.add_argument("--url", help="Database URL or host/domain supplied by the user or Agent.")
     parser.add_argument("--display-name", help="Human-readable connection name.")
     parser.add_argument("--environment", help="Environment label, e.g. qa01, prod, staging.")
     parser.add_argument("--project", help="Project or business domain this connection belongs to.")

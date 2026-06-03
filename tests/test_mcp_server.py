@@ -49,12 +49,105 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("list_envs", tool_names)
         self.assertIn("query_readonly", tool_names)
         self.assertIn("search_objects", tool_names)
+        self.assertIn("add_connection", tool_names)
 
         search_tool = next(tool for tool in responses[1]["result"]["tools"] if tool["name"] == "search_objects")
         object_types = search_tool["inputSchema"]["properties"]["object_type"]["enum"]
         self.assertIn("procedure", object_types)
         self.assertIn("function", object_types)
         self.assertIn("detail_level", search_tool["inputSchema"]["properties"])
+
+        add_tool = next(tool for tool in responses[1]["result"]["tools"] if tool["name"] == "add_connection")
+        self.assertIn("env", add_tool["inputSchema"]["required"])
+        self.assertIn("driver", add_tool["inputSchema"]["properties"])
+        self.assertIn("host", add_tool["inputSchema"]["properties"])
+        self.assertIn("password_env", add_tool["inputSchema"]["properties"])
+
+    def test_add_connection_is_visible_without_restarting_server(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / "connections.local.json"
+            responses = self.call_server(
+                [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "add_connection",
+                            "arguments": {
+                                "config": str(config),
+                                "env": "qa02",
+                                "driver": "mysql",
+                                "host": "mysql-qa02.example.internal",
+                                "username": "readonly_user",
+                                "password_env": "QA02_DB_PASSWORD",
+                                "display_name": "QNVIP QA02",
+                                "environment": "qa02",
+                                "project": "qnvip",
+                                "description": "QA02 shared readonly connection.",
+                                "aliases": ["qa-02", "test2"],
+                                "max_rows": 50,
+                            },
+                        },
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "list_envs",
+                            "arguments": {"config": str(config)},
+                        },
+                    },
+                ]
+            )
+
+            add_result = responses[0]["result"]
+            self.assertEqual(add_result["structuredContent"]["exit_code"], 0)
+            self.assertFalse(add_result["isError"])
+
+            list_result = responses[1]["result"]["structuredContent"]
+            data = list_result["json"]
+            self.assertEqual(data["environments"], ["qa02"])
+            self.assertEqual(data["connections"][0]["name"], "qa02")
+            self.assertEqual(data["connections"][0]["display_name"], "QNVIP QA02")
+            self.assertEqual(data["connections"][0]["aliases"], ["qa-02", "test2"])
+            self.assertEqual(data["connections"][0]["max_rows"], 50)
+
+    def test_add_connection_accepts_database_url_and_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / "connections.local.json"
+            responses = self.call_server(
+                [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "add_connection",
+                            "arguments": {
+                                "config": str(config),
+                                "env": "qa03",
+                                "url": "mysql://mysql-qa03.example.internal:3307/qnvip_center_order?charset=utf8mb4",
+                                "username": "readonly_user",
+                                "password": "local-secret",
+                            },
+                        },
+                    }
+                ]
+            )
+
+            result = responses[0]["result"]
+            self.assertEqual(result["structuredContent"]["exit_code"], 0)
+            data = json.loads(config.read_text(encoding="utf-8"))
+            env = data["environments"]["qa03"]
+            self.assertEqual(env["driver"], "mysql")
+            self.assertEqual(env["host"], "mysql-qa03.example.internal")
+            self.assertEqual(env["port"], 3307)
+            self.assertEqual(env["database"], "qnvip_center_order")
+            self.assertEqual(env["username"], "readonly_user")
+            self.assertEqual(env["password"], "local-secret")
+            self.assertEqual(env["params"], {"charset": "utf8mb4"})
 
     def test_tool_call_returns_structured_output(self):
         responses = self.call_server(

@@ -4,11 +4,13 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlparse
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 DB_QUERY = SKILL_ROOT / "scripts" / "db-query"
-SERVER_VERSION = "0.4.0"
+INIT_CONFIG = SKILL_ROOT / "scripts" / "init-config"
+SERVER_VERSION = "0.5.0"
 
 
 def config_paths(explicit_path=None):
@@ -39,6 +41,54 @@ def tool_schema(config_path=None):
     }
     env = {"type": "string", "description": "Configured database-cli environment name."}
     base_tools = [
+        {
+            "name": "add_connection",
+            "description": "Create or update a database-cli connection config without restarting the Agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "env": env,
+                    "url": {
+                        "type": "string",
+                        "description": "Optional database URL or host. Supports mysql/postgres/sqlite/duckdb/sqlserver/clickhouse URLs.",
+                    },
+                    "display_name": {"type": "string"},
+                    "environment": {"type": "string"},
+                    "project": {"type": "string"},
+                    "description": {"type": "string"},
+                    "aliases": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional aliases that resolve to this environment.",
+                    },
+                    "driver": {
+                        "type": "string",
+                        "enum": ["mysql", "mariadb", "postgres", "postgresql", "sqlite3", "duckdb", "sqlserver", "clickhouse"],
+                    },
+                    "host": {"type": "string"},
+                    "port": {"type": "integer", "minimum": 0},
+                    "database": {"type": "string"},
+                    "path": {"type": "string"},
+                    "username": {"type": "string"},
+                    "password": {"type": "string"},
+                    "password_env": {"type": "string"},
+                    "schema": {"type": "string"},
+                    "params": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    "max_rows": {"type": "integer", "minimum": 1},
+                    "limit_style": {"type": "string", "enum": ["limit", "none"]},
+                    "force": {
+                        "type": "boolean",
+                        "description": "Replace an existing environment entry.",
+                    },
+                },
+                "required": ["env"],
+                "additionalProperties": False,
+            },
+        },
         {
             "name": "list_envs",
             "description": "List configured database-cli environments.",
@@ -173,6 +223,100 @@ def parameter_schema(param_spec):
     if "maximum" in param_spec:
         schema["maximum"] = param_spec["maximum"]
     return schema
+
+
+def parse_database_url(raw_url):
+    if not raw_url:
+        return {}
+    if "://" not in raw_url:
+        return {"host": raw_url}
+
+    parsed = urlparse(raw_url)
+    values = {}
+    if parsed.scheme:
+        scheme = parsed.scheme.lower()
+        values["driver"] = "sqlite3" if scheme == "sqlite" else scheme
+    if parsed.hostname:
+        values["host"] = parsed.hostname
+    if parsed.port:
+        values["port"] = parsed.port
+    if parsed.username:
+        values["username"] = unquote(parsed.username)
+    if parsed.password:
+        values["password"] = unquote(parsed.password)
+
+    path = unquote(parsed.path.lstrip("/"))
+    if path:
+        if values.get("driver") in {"sqlite3", "duckdb"}:
+            values["path"] = unquote(parsed.path)
+        else:
+            values["database"] = path
+
+    params = {key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
+    if params:
+        values["params"] = params
+    return values
+
+
+def merged_connection_args(args):
+    parsed = parse_database_url(args.get("url"))
+    merged = dict(parsed)
+    for key, value in args.items():
+        if key in {"config", "url", "force"}:
+            continue
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def run_add_connection(args):
+    merged = merged_connection_args(args)
+    cmd = [str(INIT_CONFIG), "--env", args["env"], "--non-interactive"]
+    if args.get("config"):
+        cmd.extend(["--output", args["config"]])
+    if args.get("force"):
+        cmd.append("--force")
+
+    option_names = {
+        "display_name": "--display-name",
+        "environment": "--environment",
+        "project": "--project",
+        "description": "--description",
+        "driver": "--driver",
+        "host": "--host",
+        "port": "--port",
+        "database": "--database",
+        "path": "--path",
+        "username": "--username",
+        "password": "--password",
+        "password_env": "--password-env",
+        "schema": "--schema",
+        "max_rows": "--max-rows",
+        "limit_style": "--limit-style",
+    }
+    for key, option in option_names.items():
+        if key in merged and merged[key] not in (None, ""):
+            cmd.extend([option, str(merged[key])])
+    for alias in merged.get("aliases", []) or []:
+        if alias:
+            cmd.extend(["--alias", str(alias)])
+
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    if proc.returncode == 0 and merged.get("params"):
+        patch_connection_params(Path(args.get("config") or (SKILL_ROOT / "connections.local.json")), args["env"], merged["params"])
+    return process_result(proc)
+
+
+def patch_connection_params(path, env_name, params):
+    path = path.expanduser()
+    with path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    config.setdefault("environments", {}).setdefault(env_name, {})["params"] = {
+        str(key): str(value) for key, value in params.items()
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
 
 
 def add_common_args(cmd, args):
@@ -324,11 +468,17 @@ def command_for_custom_tool(name, args):
 
 
 def run_tool(name, args):
+    if name == "add_connection":
+        return run_add_connection(args)
     try:
         cmd = command_for_tool(name, args)
     except ValueError:
         cmd = command_for_custom_tool(name, args)
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    return process_result(proc)
+
+
+def process_result(proc):
     text = proc.stdout
     if proc.stderr:
         text = text + ("\n" if text else "") + proc.stderr
