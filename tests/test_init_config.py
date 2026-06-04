@@ -113,6 +113,60 @@ class InitConfigTest(unittest.TestCase):
             self.assertEqual(env["params"], {"charset": "utf8mb4"})
             self.assertEqual(env["limit_style"], "limit")
 
+    def test_config_alias_writes_output_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "connections.local.json"
+            subprocess.run(
+                [
+                    str(INIT_CONFIG),
+                    "--config",
+                    str(output),
+                    "--env",
+                    "qa04",
+                    "--url",
+                    "mysql://mysql-qa04.example.internal",
+                    "--username",
+                    "readonly_user",
+                    "--password-env",
+                    "QA04_DB_PASSWORD",
+                    "--non-interactive",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            data = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(data["environments"]["qa04"]["host"], "mysql-qa04.example.internal")
+
+    def test_install_forwards_init_config_arguments(self):
+        install = ROOT / "scripts" / "install"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "connections.local.json"
+            subprocess.run(
+                [
+                    str(install),
+                    "--skip-sq-check",
+                    "--config",
+                    str(output),
+                    "--env",
+                    "qa05",
+                    "--url",
+                    "mysql://mysql-qa05.example.internal",
+                    "--username",
+                    "readonly_user",
+                    "--password-env",
+                    "QA05_DB_PASSWORD",
+                    "--non-interactive",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            data = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(data["environments"]["qa05"]["host"], "mysql-qa05.example.internal")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,17 +38,40 @@ def ensure_sq(skill_dir, install_sq):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Install/setup database-cli skill local prerequisites and config.")
+    parser = argparse.ArgumentParser(
+        description="Install/setup database-cli skill local prerequisites and config.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Connection arguments are passed to scripts/init-config.\n"
+            "Common connection arguments:\n"
+            "  --config PATH              Config file to write\n"
+            "  --env NAME                 Environment name, e.g. qa01 or prod\n"
+            "  --url URL_OR_HOST          Database URL or host/domain\n"
+            "  --username USER            Database username\n"
+            "  --password-env ENV         Environment variable containing the password\n"
+            "  --password PASSWORD        Local password; writes only to ignored local config\n"
+            "  --display-name TEXT        Human-readable connection name\n"
+            "  --environment LABEL        Environment label\n"
+            "  --project TEXT             Project or business domain\n"
+            "  --description TEXT         Guidance for when to use the connection\n"
+            "  --alias NAME               Extra name resolving to this environment; repeatable\n"
+            "  --max-rows N               Hard maximum rows for SELECT/WITH queries\n"
+            "  --non-interactive          Fail instead of prompting for missing fields\n\n"
+            "Example:\n"
+            "  scripts/install --env qa01 --url mysql://host --username readonly_user "
+            "--password-env QA01_DB_PASSWORD --non-interactive"
+        ),
+    )
     parser.add_argument("--skip-sq-check", action="store_true", help="Do not check for sq.")
     parser.add_argument("--install-sq", action="store_true", help="Install sq with Homebrew if missing.")
     parser.add_argument("--no-install-sq", action="store_true", help="Do not install sq if missing.")
     parser.add_argument("--skip-config", action="store_true", help="Do not prompt for database connection config.")
     parser.add_argument("--force", action="store_true", help="Replace an existing environment entry.")
-    return parser.parse_args()
+    return parser.parse_known_args()
 
 
 def main():
-    args = parse_args()
+    args, init_config_args = parse_args()
     skill_dir = Path(__file__).resolve().parents[1]
 
     install_sq = None
@@ -66,7 +89,7 @@ def main():
         return 0
 
     init_config = skill_dir / "scripts" / "init-config"
-    cmd = [str(init_config)]
+    cmd = [str(init_config), *init_config_args]
     if args.force:
         cmd.append("--force")
     return run(cmd, skill_dir)

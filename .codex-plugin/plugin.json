@@ -1,6 +1,6 @@
 {
   "name": "database-cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "CLI-first read-only database investigation Skill.",
   "author": {
     "name": "Cassian Florin",

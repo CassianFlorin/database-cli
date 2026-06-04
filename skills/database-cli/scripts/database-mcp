@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, unquote, urlparse
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 DB_QUERY = SKILL_ROOT / "scripts" / "db-query"
 INIT_CONFIG = SKILL_ROOT / "scripts" / "init-config"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.5.1"
 
 
 def config_paths(explicit_path=None):

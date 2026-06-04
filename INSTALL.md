@@ -22,11 +22,29 @@ mkdir -p "$HOME/.codex/skills"
 ln -sfn "$PWD/skills/database-cli" "$HOME/.codex/skills/database-cli"
 ```
 
-3. 在插件根目录运行：
+3. 在插件根目录运行安装入口。没有连接参数时它会交互式询问：
 
 ```bash
 scripts/install
 ```
+
+如果用户已经给出连接信息，优先一条命令完成依赖检查和配置写入：
+
+```bash
+scripts/install \
+  --env qa01 \
+  --url "mysql://mysql-qa01.example.internal" \
+  --display-name "QNVIP QA01" \
+  --environment qa01 \
+  --project qnvip \
+  --description "QA01 shared readonly connection; search all visible schemas unless narrowed." \
+  --alias qa-01 \
+  --username readonly_user \
+  --password-env QA01_DB_PASSWORD \
+  --non-interactive
+```
+
+如需写到指定配置文件，加 `--config /path/to/connections.local.json`。如需覆盖已有环境，加 `--force`。
 
 4. 如果提示缺少 `sq`，先询问用户是否允许用 Homebrew 安装。
 
@@ -72,10 +90,10 @@ printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | scripts/
 
 ## 非交互式示例
 
-如果用户已经提供连接信息，可以直接运行：
+如果用户已经提供连接信息，可以直接运行 `scripts/install`。它会检查 `sq` 并把连接参数透传给 `scripts/init-config`：
 
 ```bash
-scripts/init-config \
+scripts/install \
   --env qa01 \
   --url "mysql://mysql-qa01.example.internal" \
   --display-name "QNVIP QA01" \
@@ -84,7 +102,8 @@ scripts/init-config \
   --description "QA01 shared readonly connection; search all visible schemas unless narrowed." \
   --alias qa-01 \
   --username readonly_user \
-  --password-env QA01_DB_PASSWORD
+  --password-env QA01_DB_PASSWORD \
+  --non-interactive
 ```
 
 然后验证：

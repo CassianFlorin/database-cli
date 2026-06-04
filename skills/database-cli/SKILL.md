@@ -9,6 +9,59 @@ Use this skill for database-backed investigation through the local database CLI 
 
 `database-cli` is CLI-first. `scripts/db-query` is the authoritative execution path for schema discovery, read-only SQL, safety checks, limits, and repair-SQL evidence gathering. `scripts/database-mcp` is only an optional adapter for clients that need MCP tools; it must not become a separate query engine or product surface.
 
+## Agent Quick Start
+
+Use this path by default. It minimizes user prompts and keeps all DB access behind the read-only wrapper.
+
+1. Check whether the local setup is ready:
+
+```bash
+scripts/db-query --list-envs
+```
+
+2. If config is missing or no suitable environment exists, ask the user only for the missing connection facts:
+
+- environment name, such as `qa01` or `prod`
+- database URL or host/domain
+- username
+- password environment variable, or a local password if the user explicitly prefers it
+- optional display name, project, description, alias, and `max_rows`
+
+3. Create or update the connection with the install entrypoint. This single command checks `sq` and writes config:
+
+```bash
+scripts/install \
+  --env qa01 \
+  --url "mysql://mysql-qa01.example.internal" \
+  --username readonly_user \
+  --password-env QA01_DB_PASSWORD \
+  --non-interactive
+```
+
+Use `--config /path/to/connections.local.json` when the user wants a non-default config path. Use `--force` only when the user is updating an existing environment.
+
+4. Verify with the cheapest safe calls:
+
+```bash
+scripts/db-query --list-envs
+scripts/db-query --env qa01 --sql "SELECT 1"
+```
+
+For production, run `SELECT 1` only after the user has agreed to a production connection check.
+
+5. During investigation, discover metadata before data. Do not ask the user to choose a database/schema first:
+
+```bash
+scripts/db-query --env qa01 --search-objects "%order_no%" --object-type column --table cc_order
+scripts/db-query --env qa01 --sql "SELECT id, order_no, status FROM qnvip_center_commerce.cc_order WHERE order_no = 'YP...'"
+```
+
+If a SQL statement is questionable, validate it without execution:
+
+```bash
+scripts/db-query --check-sql "SELECT id FROM cc_order WHERE order_no = 'YP...'"
+```
+
 ## Hard Rules
 
 - Confirm the target environment/connection before querying. If the environment is missing or ambiguous, list configured environments and connection metadata, then ask the user to choose.
@@ -40,17 +93,33 @@ If `sq` is missing, tell the user to install it with:
 brew install sq
 ```
 
-If no environments are configured, read `references/config.md` and ask the user to create a local `connections.local.json` with database server address/domain, optional port, username, and password or `password_env`. The default local config path is `skills/database-cli/connections.local.json` when using the plugin root wrapper. Do not invent hosts, credentials, or environment mappings.
+If no environments are configured, ask for only the connection facts needed by `scripts/install`: environment name, database URL or host/domain, username, and password or `password_env`. The default local config path is `skills/database-cli/connections.local.json` when using the plugin root wrapper. Do not invent hosts, credentials, or environment mappings.
 
 If the user is installing or adding a connection through an Agent and the connection details are missing, ask the user for the database URL or host, username, and either password or password environment variable. Do not guess connection URLs, usernames, passwords, or access scope.
 
-For first-run setup after installing the Skill, use the install entrypoint:
+For first-run setup after installing the Skill, use the install entrypoint. It can run interactively:
 
 ```bash
 scripts/install
 ```
 
-It checks for `sq` and then asks the user for database connection details. Standard Skill installation does not automatically run post-install hooks, so this command is the required setup step.
+It can also configure a connection non-interactively:
+
+```bash
+scripts/install \
+  --env qa01 \
+  --url "mysql://mysql-qa01.example.internal" \
+  --display-name "QNVIP QA01" \
+  --environment qa01 \
+  --project qnvip \
+  --description "Shared QA readonly connection; search all visible schemas unless narrowed." \
+  --alias qa-01 \
+  --username readonly_user \
+  --password-env QA01_DB_PASSWORD \
+  --non-interactive
+```
+
+Standard Skill installation does not automatically run post-install hooks, so `scripts/install` is the required setup step. Prefer this command over separate dependency and config steps.
 
 For config-only setup, use the initializer instead of hand-writing JSON:
 
@@ -58,13 +127,13 @@ For config-only setup, use the initializer instead of hand-writing JSON:
 scripts/init-config
 ```
 
-The initializer also accepts a user-provided database URL:
+The initializer accepts the same connection flags. Use it when `sq` has already been checked and only the config file must be changed:
 
 ```bash
-scripts/init-config --env qa01 --url "mysql://mysql-qa01.example.internal" --username readonly_user --password-env QA01_DB_PASSWORD
+scripts/init-config --env qa01 --url "mysql://mysql-qa01.example.internal" --username readonly_user --password-env QA01_DB_PASSWORD --non-interactive
 ```
 
-The initializer prompts for database server address/domain, optional port, username, and password storage. Default database/schema is optional; the user can choose the concrete database/schema in SQL with fully-qualified names.
+`scripts/init-config --config /path/to/connections.local.json` is accepted as an alias for `--output`. Default database/schema is optional; the user can choose the concrete database/schema in SQL with fully-qualified names.
 
 ## Query Workflow
 
@@ -75,7 +144,7 @@ The initializer prompts for database server address/domain, optional port, usern
 scripts/db-query --list-envs
 ```
 
-3. For schema or table discovery, prefer:
+3. For schema or table discovery, prefer metadata search first. Use inspect when the user needs a source/table overview:
 
 ```bash
 scripts/db-query --env qa01 --inspect
@@ -107,6 +176,15 @@ scripts/db-query --env qa01 --sql "SELECT id, order_no, status FROM dbname.schem
 ```
 
 6. Summarize only the fields needed to answer the user. Avoid spreading unrelated sensitive data.
+
+7. When the user needs a data repair, do not execute it. Return a human-reviewed script package:
+
+- target environment and connection name
+- pre-check SQL and current evidence
+- proposed change SQL
+- post-check SQL
+- rollback or recovery note
+- explicit statement that database-cli did not execute the mutation
 
 ## Optional MCP Adapter
 
@@ -152,10 +230,10 @@ Use a specific config file:
 DATABASE_CLI_CONFIG=/path/to/connections.json scripts/db-query --list-envs
 ```
 
-Create or update local config non-interactively:
+Create or update local config non-interactively through the install entrypoint:
 
 ```bash
-scripts/init-config --env qa01 --url "mysql://mysql-qa01.example.internal" --username readonly_user --password-env QA01_DB_PASSWORD
+scripts/install --env qa01 --url "mysql://mysql-qa01.example.internal" --username readonly_user --password-env QA01_DB_PASSWORD --non-interactive
 ```
 
 ## Notes

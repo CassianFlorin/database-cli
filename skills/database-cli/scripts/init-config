@@ -178,8 +178,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Create or update local database-cli connection config.")
     parser.add_argument(
         "--output",
+        "--config",
+        dest="output",
         default=str(SKILL_ROOT / "connections.local.json"),
-        help="Config file to write.",
+        help="Config file to write. --config is accepted as an alias for consistency with db-query.",
     )
     parser.add_argument("--env", help="Environment name, e.g. qa01 or prod.")
     parser.add_argument("--url", help="Database URL or host/domain supplied by the user or Agent.")

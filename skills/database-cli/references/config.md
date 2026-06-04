@@ -19,13 +19,24 @@ scripts/install
 
 It checks for `sq`, optionally installs it with Homebrew, then asks the user for the SQL connection address and authorization details.
 
-If you only need to create or update config, run the initializer directly:
+If the user already provided connection details, pass them directly to `scripts/install` and finish setup in one command:
+
+```bash
+scripts/install \
+  --env qa01 \
+  --url "mysql://mysql-qa01.example.internal:3306/qnvip_center_order?charset=utf8mb4" \
+  --username readonly_user \
+  --password-env QA01_DB_PASSWORD \
+  --non-interactive
+```
+
+If you only need to create or update config and do not need the `sq` check, run the initializer directly:
 
 ```bash
 scripts/init-config
 ```
 
-The initializer writes `skills/database-cli/connections.local.json` with file mode `0600` when run through the plugin root wrapper. If run from inside `skills/database-cli`, it writes that same local config file.
+The initializer writes `skills/database-cli/connections.local.json` with file mode `0600` when run through the plugin root wrapper. If run from inside `skills/database-cli`, it writes that same local config file. `--config` is accepted as an alias for `--output`.
 
 The initializer can accept either split fields or a user-provided database URL. Explicit flags override values parsed from the URL:
 
@@ -34,13 +45,14 @@ scripts/init-config \
   --env qa01 \
   --url "mysql://mysql-qa01.example.internal:3306/qnvip_center_order?charset=utf8mb4" \
   --username readonly_user \
-  --password-env QA01_DB_PASSWORD
+  --password-env QA01_DB_PASSWORD \
+  --non-interactive
 ```
 
 For non-interactive setup:
 
 ```bash
-scripts/init-config \
+scripts/install \
   --env qa01 \
   --url "mysql://mysql-qa01.example.internal" \
   --display-name "QNVIP QA01" \
@@ -49,7 +61,8 @@ scripts/init-config \
   --description "Shared QA readonly connection; search all visible schemas unless narrowed." \
   --alias qa-01 \
   --username readonly_user \
-  --password-env QA01_DB_PASSWORD
+  --password-env QA01_DB_PASSWORD \
+  --non-interactive
 ```
 
 The resulting `connections.local.json` uses direct database connection fields:
