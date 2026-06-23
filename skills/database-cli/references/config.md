@@ -180,7 +180,7 @@ If you already manage sources with `sq add`, the config can point to the existin
 
 ```json
 {
-  "sq_config": "/Users/me/.config/sq/sq.yml",
+  "sq_config": "/path/to/sq.yml",
   "environments": {
     "qa01": {
       "source": "@qnvip_qa01_commerce",

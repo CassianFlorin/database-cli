@@ -11,8 +11,9 @@
 1. 如果本地还没有仓库，优先用 GitHub CLI 克隆：
 
 ```bash
-gh repo clone CassianFlorin/database-cli /Users/huapai/OpenSourceProject/database-cli
-cd /Users/huapai/OpenSourceProject/database-cli
+mkdir -p "$HOME/src"
+gh repo clone CassianFlorin/database-cli "$HOME/src/database-cli"
+cd "$HOME/src/database-cli"
 ```
 
 2. 把 Skill 暴露给 Codex 本地 skills 目录。开发/本机安装可以使用符号链接：
