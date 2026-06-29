@@ -18,6 +18,38 @@ def run(cmd, cwd):
     return subprocess.run(cmd, cwd=cwd, check=False).returncode
 
 
+HOST_SKILL_DIRS = {
+    "codex": Path.home() / ".codex" / "skills",
+    "claude": Path.home() / ".claude" / "skills",
+}
+
+
+def prompt_host():
+    print("Link the skill into an agent's local skills directory?")
+    print("  1) Codex      (~/.codex/skills)")
+    print("  2) Claude Code (~/.claude/skills)")
+    print("  3) Both")
+    print("  4) Skip")
+    choice = input("Choose [1/2/3/4]: ").strip()
+    return {"1": "codex", "2": "claude", "3": "both", "4": "none"}.get(choice, "none")
+
+
+def link_skill(host, skill_dir):
+    if host == "none":
+        return
+    hosts = ["codex", "claude"] if host == "both" else [host]
+    for name in hosts:
+        link = HOST_SKILL_DIRS[name] / skill_dir.name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink():
+            link.unlink()
+        elif link.exists():
+            print(f"Skipped {name} skill link: {link} already exists and is not a symlink.")
+            continue
+        link.symlink_to(skill_dir, target_is_directory=True)
+        print(f"Linked {name} skill: {link} -> {skill_dir}")
+
+
 def ensure_sq(skill_dir, install_sq):
     if shutil.which("sq"):
         print("sq found.")
@@ -66,6 +98,12 @@ def parse_args():
     parser.add_argument("--install-sq", action="store_true", help="Install sq with Homebrew if missing.")
     parser.add_argument("--no-install-sq", action="store_true", help="Do not install sq if missing.")
     parser.add_argument("--skip-config", action="store_true", help="Do not prompt for database connection config.")
+    parser.add_argument(
+        "--host",
+        choices=["codex", "claude", "both", "none"],
+        default=None,
+        help="Link the skill into an agent's local skills directory.",
+    )
     parser.add_argument("--force", action="store_true", help="Replace an existing environment entry.")
     return parser.parse_known_args()
 
@@ -84,6 +122,11 @@ def main():
         rc = ensure_sq(skill_dir, install_sq)
         if rc != 0:
             return rc
+
+    host = args.host
+    if host is None:
+        host = "none" if "--non-interactive" in init_config_args else prompt_host()
+    link_skill(host, skill_dir)
 
     if args.skip_config:
         return 0
