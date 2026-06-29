@@ -1,0 +1,62 @@
+name: Release
+
+# 主分支每次更新后：跑测试 -> 按 Conventional Commits 计算版本 -> 打 tag + 发布 Release
+on:
+  push:
+    branches:
+      - main
+
+# 串行执行，避免多次 push 并发打出冲突的 tag
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  release:
+    name: Tag & Release
+    needs: test
+    runs-on: ubuntu-latest
+    # 跳过机器人/合并产生的空提交场景可在此扩展条件
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 计算版本需要完整历史与已有 tag
+          fetch-depth: 0
+
+      - name: Determine next version
+        id: tag
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # 沿用现有 vX.Y.Z 命名
+          tag_prefix: v
+          # 非 feat/fix 提交（如 docs/chore）默认按 patch 递增，
+          # 保证主分支每次更新都会产出新版本；如只想在 feat/fix 时发版，
+          # 改为 default_bump: false
+          default_bump: patch
+          release_branches: main
+
+      - name: Create GitHub Release
+        if: steps.tag.outputs.new_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.new_tag }}
+          name: ${{ steps.tag.outputs.new_tag }}
+          body: ${{ steps.tag.outputs.changelog }}
