@@ -16,12 +16,19 @@ gh repo clone CassianFlorin/database-cli "$HOME/src/database-cli"
 cd "$HOME/src/database-cli"
 ```
 
-2. 把 Skill 暴露给 Codex 本地 skills 目录。开发/本机安装可以使用符号链接：
+2. 把 Skill 暴露给 agent 本地 skills 目录。开发/本机安装可以使用符号链接：
 
 ```bash
+# Codex
 mkdir -p "$HOME/.codex/skills"
 ln -sfn "$PWD/skills/database-cli" "$HOME/.codex/skills/database-cli"
+
+# Claude Code
+mkdir -p "$HOME/.claude/skills"
+ln -sfn "$PWD/skills/database-cli" "$HOME/.claude/skills/database-cli"
 ```
+
+现在也可以用 `scripts/install --host both` 一步完成软链（`--host codex|claude|both|none`，不带 `--host` 时交互式询问）。
 
 3. 在插件根目录运行安装入口。没有连接参数时它会交互式询问：
 
