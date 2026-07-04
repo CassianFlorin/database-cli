@@ -1,6 +1,7 @@
 import json
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,6 +62,79 @@ class DbQueryTest(unittest.TestCase):
             self.assertNotIn("password", json.dumps(data))
             self.assertNotIn("QA01_DB_PASSWORD", json.dumps(data))
 
+    def test_setup_status_reports_ready_state_without_secrets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(
+                tmpdir,
+                {
+                    "display_name": "QNVIP QA01",
+                    "environment": "qa01",
+                    "project": "qnvip",
+                    "description": "Shared QA readonly connection.",
+                    "aliases": ["qa-01"],
+                    "driver": "mysql",
+                    "host": "mysql-qa01.example.internal",
+                    "username": "readonly_user",
+                    "password": "secret",
+                    "password_env": "QA01_DB_PASSWORD",
+                    "max_rows": 100,
+                },
+            )
+
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--config",
+                    str(config),
+                    "--sq-bin",
+                    sys.executable,
+                    "--setup-status",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            data = json.loads(result.stdout)
+            self.assertTrue(data["ready"])
+            self.assertTrue(data["sq_available"])
+            self.assertEqual(data["config"]["path"], str(config))
+            self.assertEqual(data["environments"], ["qa01"])
+            self.assertEqual(data["connections"][0]["name"], "qa01")
+            self.assertEqual(data["connections"][0]["display_name"], "QNVIP QA01")
+            self.assertEqual(data["next_actions"][0]["command"], "scripts/db-query --list-envs")
+            self.assertNotIn("password", json.dumps(data))
+            self.assertNotIn("QA01_DB_PASSWORD", json.dumps(data))
+            self.assertNotIn("secret", json.dumps(data))
+
+    def test_setup_status_reports_missing_config_as_actionable_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "missing-connections.json"
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--config",
+                    str(missing),
+                    "--sq-bin",
+                    "definitely-missing-sq-for-test",
+                    "--setup-status",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            data = json.loads(result.stdout)
+            self.assertFalse(data["ready"])
+            self.assertFalse(data["config"]["exists"])
+            self.assertFalse(data["sq_available"])
+            problem_codes = {problem["code"] for problem in data["problems"]}
+            self.assertIn("missing_config", problem_codes)
+            self.assertIn("missing_sq", problem_codes)
+            commands = [action["command"] for action in data["next_actions"]]
+            self.assertIn("brew install sq", commands)
+            self.assertTrue(any(command.startswith("scripts/install --env") for command in commands))
+
     def test_env_alias_resolves_to_canonical_connection(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self.write_config(
@@ -90,6 +164,81 @@ class DbQueryTest(unittest.TestCase):
             )
 
             self.assertIn("@database_cli_qa01", result.stdout)
+
+    def test_ad_hoc_connection_can_query_without_config_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "missing-connections.json"
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--config",
+                    str(missing),
+                    "--url",
+                    "mysql://mysql-adhoc.example.internal:3307/qnvip_center_order?charset=utf8mb4",
+                    "--username",
+                    "readonly_user",
+                    "--password",
+                    "local-secret",
+                    "--sql",
+                    "SELECT 1",
+                    "--print-command",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertIn("@database_cli_adhoc", result.stdout)
+            self.assertIn("mysql-adhoc.example.internal:3307", result.stdout)
+            self.assertIn("qnvip_center_order", result.stdout)
+            self.assertIn("SELECT 1 LIMIT 200", result.stdout)
+            self.assertNotIn("local-secret", result.stdout)
+
+    def test_write_sql_is_rejected_without_explicit_allow_write(self):
+        result = subprocess.run(
+            [
+                str(DB_QUERY),
+                "--check-sql",
+                "UPDATE cc_order SET status = 1 WHERE id = 10",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("SQL must start with a read-only token", result.stderr)
+
+    def test_write_sql_is_allowed_only_with_explicit_allow_write(self):
+        result = subprocess.run(
+            [
+                str(DB_QUERY),
+                "--allow-write",
+                "--check-sql",
+                "UPDATE cc_order SET status = 1 WHERE id = 10",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        self.assertEqual(result.stdout.strip(), "UPDATE cc_order SET status = 1 WHERE id = 10")
+
+    def test_approved_update_and_delete_still_require_where_clause(self):
+        result = subprocess.run(
+            [
+                str(DB_QUERY),
+                "--allow-write",
+                "--check-sql",
+                "DELETE FROM cc_order",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires a WHERE clause", result.stderr)
 
     def test_prints_mysql_column_search_command(self):
         with tempfile.TemporaryDirectory() as tmpdir:

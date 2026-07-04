@@ -50,6 +50,8 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("query_readonly", tool_names)
         self.assertIn("search_objects", tool_names)
         self.assertIn("add_connection", tool_names)
+        self.assertIn("setup_status", tool_names)
+        self.assertIn("execute_sql", tool_names)
 
         search_tool = next(tool for tool in responses[1]["result"]["tools"] if tool["name"] == "search_objects")
         object_types = search_tool["inputSchema"]["properties"]["object_type"]["enum"]
@@ -62,6 +64,44 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("driver", add_tool["inputSchema"]["properties"])
         self.assertIn("host", add_tool["inputSchema"]["properties"])
         self.assertIn("password_env", add_tool["inputSchema"]["properties"])
+
+        status_tool = next(tool for tool in responses[1]["result"]["tools"] if tool["name"] == "setup_status")
+        self.assertIn("sq_bin", status_tool["inputSchema"]["properties"])
+
+        execute_tool = next(tool for tool in responses[1]["result"]["tools"] if tool["name"] == "execute_sql")
+        self.assertEqual(execute_tool["inputSchema"]["required"], ["sql"])
+        self.assertIn("url", execute_tool["inputSchema"]["properties"])
+        self.assertIn("allow_write", execute_tool["inputSchema"]["properties"])
+
+    def test_setup_status_returns_actionable_structured_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "missing-connections.json"
+            responses = self.call_server(
+                [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "setup_status",
+                            "arguments": {
+                                "config": str(missing),
+                                "sq_bin": "definitely-missing-sq-for-test",
+                            },
+                        },
+                    }
+                ]
+            )
+
+            result = responses[0]["result"]
+            self.assertEqual(result["structuredContent"]["exit_code"], 0)
+            data = result["structuredContent"]["json"]
+            self.assertFalse(data["ready"])
+            self.assertFalse(data["config"]["exists"])
+            problem_codes = {problem["code"] for problem in data["problems"]}
+            self.assertIn("missing_config", problem_codes)
+            self.assertIn("missing_sq", problem_codes)
+            self.assertTrue(any(action["command"] == "brew install sq" for action in data["next_actions"]))
 
     def test_add_connection_is_visible_without_restarting_server(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -170,6 +210,35 @@ class McpServerTest(unittest.TestCase):
         self.assertEqual(result["structuredContent"]["stderr"], "")
         self.assertEqual(result["structuredContent"]["stdout"], "SELECT 1 LIMIT 200")
         self.assertEqual(result["content"][0]["text"], "SELECT 1 LIMIT 200")
+
+    def test_execute_sql_supports_ad_hoc_write_with_explicit_allow_write(self):
+        responses = self.call_server(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "execute_sql",
+                        "arguments": {
+                            "url": "mysql://mysql-adhoc.example.internal:3306/qnvip_center_order",
+                            "username": "readonly_user",
+                            "password": "local-secret",
+                            "sql": "UPDATE cc_order SET status = 1 WHERE id = 10",
+                            "allow_write": True,
+                            "print_command": True,
+                        },
+                    },
+                }
+            ]
+        )
+
+        result = responses[0]["result"]
+        self.assertEqual(result["structuredContent"]["exit_code"], 0)
+        stdout = result["structuredContent"]["stdout"]
+        self.assertIn("@database_cli_adhoc", stdout)
+        self.assertIn("UPDATE cc_order SET status = 1 WHERE id = 10", stdout)
+        self.assertNotIn("local-secret", stdout)
 
     def test_lists_configured_custom_tool(self):
         with tempfile.TemporaryDirectory() as tmpdir:

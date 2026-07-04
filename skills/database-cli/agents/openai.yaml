@@ -1,6 +1,6 @@
 interface:
   display_name: "Database CLI"
   short_description: "CLI-first database investigation Skill"
-  default_prompt: "Use $database-cli to inspect database schema, run safe read-only SQL through scripts/db-query, and prepare human-reviewed repair SQL when data changes are needed."
+  default_prompt: "Use $database-cli to inspect database schema, run safe SQL through scripts/db-query with read-only defaults, and execute repair SQL only when the user explicitly approves write opt-in."
 policy:
   allow_implicit_invocation: true

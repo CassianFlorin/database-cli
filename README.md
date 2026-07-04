@@ -1,8 +1,8 @@
 # Database CLI Plugin
 
-这是一个 CLI-first 的 Codex Plugin，内置 `database-cli` Skill。它面向数据库问题排查：查看表结构、搜索 schema/table/column/index/procedure、执行有范围的只读 SQL、跨环境核对记录，以及在需要修数时产出给人工执行的 SQL。
+这是一个 CLI-first 的 Codex Plugin，内置 `database-cli` Skill。它面向数据库问题排查：查看表结构、搜索 schema/table/column/index/procedure、执行有范围的 SQL、跨环境核对记录，以及在需要修数时产出或执行用户明确允许的变更 SQL。
 
-底层使用 [`sq`](https://sq.io/) 作为数据库 CLI 后端，并通过本项目的 wrapper 做安全限制。`scripts/db-query` 是唯一真实查询入口；`scripts/database-mcp` 是可选的薄适配层，只把同一套 CLI 能力暴露给支持 MCP 的客户端。
+底层使用 [`sq`](https://sq.io/) 作为数据库 CLI 后端，并通过本项目的 wrapper 做安全限制。`scripts/db-query` 是唯一真实执行入口；`scripts/database-mcp` 是可选的薄适配层，只把同一套 CLI 能力暴露给支持 MCP 的客户端。
 
 ## 核心理念
 
@@ -10,24 +10,25 @@
 
 项目边界：
 
-- CLI 是产品本体：安装、配置、schema 搜索、只读查询、安全校验和修数 SQL 工作流都先落在 `scripts/db-query` 和 Skill 指令中。
+- CLI 是产品本体：安装、配置、临时连接、schema 搜索、SQL 安全校验和修数 SQL 工作流都先落在 `scripts/db-query` 和 Skill 指令中。
 - MCP 是适配层：`scripts/database-mcp` 不能另起查询逻辑，只能委托 CLI；安全规则必须由 CLI 层兜底。
-- Skill 是使用规范：Agent 应按 `SKILL.md` 先确认环境、读取真实 schema、执行有界只读查询，需要改数据时只输出人工执行 SQL。
+- Skill 是使用规范：Agent 应按 `SKILL.md` 先确认环境、读取真实 schema、默认执行有界只读查询；需要改数据时，必须先获得用户明确允许，再使用显式写入开关。
 - 不追求 DBHub 平台能力：不做 Workbench、权限平台、多租户服务端或独立数据库管理产品。
 
 ## 能力范围
 
-- 通过 `scripts/db-query` 执行只读 SQL，这是唯一真实查询入口。
+- 通过 `scripts/db-query` 执行 SQL，这是唯一真实执行入口；默认只读，只有显式 `--allow-write` 才允许 DML。
+- 通过 `scripts/db-query --setup-status` 输出 Agent 友好的安装状态、缺失项和下一步动作；这个命令不连接数据库。
 - 通过 `SKILL.md` 固化 Agent 查询流程、安全边界和人工修数 SQL 输出规范。
 - 通过 `scripts/database-mcp` 可选暴露 stdio MCP 工具；它只委托 `scripts/db-query`，不拥有独立查询逻辑。
-- 通过本地 `connections.local.json` 保存连接配置。
+- 可通过本地 `connections.local.json` 保存连接配置，也可以由用户在单次调用里提供 `--url`、`--host`、用户名和密码环境变量等连接信息。
 - 按环境/账号权限管理连接，例如 `qa01`、`prod`，让 Agent 和开发者使用同一套入口。
 - 连接配置支持 `display_name`、`environment`、`project`、`description`、`aliases` 等元信息，便于 Agent 选择正确连接。
 - 默认按数据库实例/服务端连接，不把配置限制到某个 database/schema。
 - 支持只配置域名，不配置端口；适用于域名或反向代理已处理端口的场景。
 - 支持对象搜索：schema、table、column、index、procedure/function metadata，并支持 `names`、`summary`、`full` 三档详情。
-- 支持配置级 `max_rows` 上限；`readonly=false` 会被拒绝，不会打开写权限。
-- 拦截常见写入、DDL、权限、事务、过程、锁、导出和副作用 SQL。
+- 支持配置级 `max_rows` 上限；`readonly=false` 会被拒绝，不会用配置隐式打开写权限。
+- 默认拦截写入；用户明确允许后可用 `--allow-write` 执行 `INSERT`、`UPDATE`、`DELETE`、`REPLACE`。DDL、权限、事务、过程、锁、导出和副作用 SQL 仍会被拦截。
 - 避免把密码写入命令行 DSN；本地密钥文件不提交到仓库。
 
 ## 目录结构
@@ -92,6 +93,14 @@ scripts/install \
 
 这条命令会把连接参数透传给 `scripts/init-config`。如需写到指定配置文件，可加 `--config /path/to/connections.local.json`；如需覆盖已有环境，可加 `--force`。
 
+安装后优先让 Agent 运行状态检查，而不是直接尝试连接数据库：
+
+```bash
+scripts/db-query --setup-status
+```
+
+输出是 JSON，包含 `ready`、`sq_available`、`config`、`environments`、`connections`、`problems` 和 `next_actions`。Agent 应先按 `next_actions` 处理缺失项；只有 `ready=true` 且用户确认目标环境后，才继续做真实只读查询。
+
 ## 从已有查询习惯迁移
 
 如果你已经知道常用环境名和连接信息，不需要先理解 `sq` 的 source 管理方式，直接用 `scripts/install` 创建本地环境即可：
@@ -108,11 +117,12 @@ scripts/install \
   --username readonly_user \
   --password-env QA01_DB_PASSWORD \
   --non-interactive
+scripts/db-query --setup-status
 scripts/db-query --list-envs
 scripts/db-query --env qa01 --sql "SELECT 1"
 ```
 
-建议保留你原来习惯的环境名，并把连接理解为“这个环境下账号可访问的一组库”，而不是某一个 database。`--list-envs` 会返回连接元信息，帮助 Agent 判断该用哪个连接。真正查询数据时，在 SQL 里写全限定表名：
+建议保留你原来习惯的环境名，并把连接理解为“这个环境下账号可访问的一组库”，而不是某一个 database。`--setup-status` 和 `--list-envs` 会返回连接元信息，帮助 Agent 判断该用哪个连接。真正查询数据时，在 SQL 里写全限定表名：
 
 ```bash
 scripts/db-query --env qa01 --sql "SELECT id FROM qnvip_center_commerce.cc_order WHERE order_no = 'YP...'"
@@ -153,9 +163,11 @@ scripts/db-query --env qa01 --inspect cc_order
 
 `scripts/database-mcp` 是一个无额外 Python 依赖的 stdio MCP adapter。它不是独立产品入口，实际查询、校验、限流和连接配置仍全部复用 `scripts/db-query`。它提供：
 
+- `setup_status`：返回安装状态、缺失项和下一步动作；不连接数据库。
 - `list_envs`：列出当前配置的环境。
 - `add_connection`：运行中的 Agent 新增或更新连接配置；后续工具调用会立即读取新配置，不需要重启 Agent。
 - `query_readonly`：执行只读 SQL。
+- `execute_sql`：执行 SQL，默认只读；用户明确允许后传 `allow_write=true` 才允许 DML。
 - `inspect`：查看 source 或表结构。
 - `search_objects`：搜索 schema/table/column/index/procedure/function metadata。
 - `check_sql`：只校验 SQL 安全性，不执行。
@@ -209,6 +221,7 @@ MCP 客户端如需结构化工具入口，可以把 command 指到插件根目�
 2. 进入 "$HOME/src/database-cli"。
 3. 把 skills/database-cli 安装到 ~/.codex/skills/database-cli（可用符号链接）。
 4. 运行 scripts/install，帮我完成 database-cli 的安装后配置；如果我已给出连接信息，直接把 --env/--url/--username/--password-env 等参数传给 scripts/install。
+5. 运行 scripts/db-query --setup-status，并根据 JSON 里的 next_actions 继续处理。
 如果缺少 sq，请先询问我是否允许用 Homebrew 安装。
 如果缺少数据库连接信息，请向我询问连接链接或 host、用户名、密码或密码环境变量，不要猜测地址、用户名、密码或访问范围。
 ```
@@ -225,7 +238,7 @@ description=QA01 共享只读连接，默认搜索账号可见库
 alias=qa-01
 username=readonly_user
 password 使用环境变量 QA01_DB_PASSWORD
-然后运行 scripts/db-query --list-envs 验证配置已写入。
+然后运行 scripts/db-query --setup-status 验证配置已写入；ready=true 后再运行 scripts/db-query --list-envs。
 ```
 
 Agent 实际会执行类似命令：
@@ -236,6 +249,7 @@ gh repo clone CassianFlorin/database-cli "$HOME/src/database-cli"
 cd "$HOME/src/database-cli"
 ln -sfn "$PWD/skills/database-cli" "$HOME/.codex/skills/database-cli"
 scripts/install
+scripts/db-query --setup-status
 ```
 
 或非交互式安装并创建配置：
@@ -284,11 +298,14 @@ scripts/install \
 }
 ```
 
-调用成功后，Agent 立即可以继续调用 `list_envs`、`search_objects`、`query_readonly` 使用 `qa02`。MCP adapter 每次工具调用都会读取配置文件，所以不依赖进程重启。
+调用成功后，Agent 可以先调用 `setup_status` 确认配置已可见，再继续调用 `list_envs`、`search_objects`、`query_readonly` 或 `execute_sql` 使用 `qa02`。MCP adapter 每次工具调用都会读取配置文件，所以不依赖进程重启。
 
 边界如下：
 
 - Agent 可以运行 `scripts/install`、`scripts/init-config`、`scripts/db-query`。
+- Agent 可以先运行 `scripts/db-query --setup-status` 或 MCP `setup_status`，根据结构化 `next_actions` 决定下一步。
+- Agent 可以不创建本地配置，直接把用户提供的 `--url`/`--host`、`--username`、`--password-env` 传给 `scripts/db-query` 或 MCP `execute_sql`。
+- Agent 默认只能执行只读 SQL；只有用户明确允许修改时，才可以传 `--allow-write` 或 MCP `allow_write=true` 执行 DML。
 - Agent 可以通过 MCP `add_connection` 工具在运行中创建或更新连接配置。
 - Agent 可以根据用户提供的信息创建或更新 `connections.local.json`。
 - Agent 可以帮用户检查 `sq` 是否安装，并在用户允许时通过 Homebrew 安装。
@@ -450,6 +467,16 @@ scripts/db-query --list-envs
 scripts/db-query --env qa01 --sql "SELECT id FROM qnvip_center_commerce.cc_order WHERE order_no = 'YP...'"
 ```
 
+不落本地配置，直接使用用户提供的临时连接信息：
+
+```bash
+scripts/db-query \
+  --url "mysql://mysql-qa01.example.internal:3306/qnvip_center_commerce" \
+  --username readonly_user \
+  --password-env QA01_DB_PASSWORD \
+  --sql "SELECT id, order_no FROM cc_order WHERE order_no = 'YP...'"
+```
+
 预览将要执行的 `sq` 命令，不真正查询数据库：
 
 ```bash
@@ -480,9 +507,18 @@ DATABASE_CLI_CONFIG=/path/to/connections.json scripts/db-query --list-envs
 scripts/db-query --check-sql "SELECT * FROM qnvip_center_commerce.cc_order WHERE order_no = 'YP...'"
 ```
 
+用户明确允许修改后，才可以显式开启 DML：
+
+```bash
+scripts/db-query \
+  --env qa01 \
+  --allow-write \
+  --sql "UPDATE qnvip_center_commerce.cc_order SET status = 1 WHERE id = 10"
+```
+
 ## 安全规则
 
-允许的起始关键字：
+默认允许的起始关键字：
 
 - `SELECT`
 - `SHOW`
@@ -491,9 +527,17 @@ scripts/db-query --check-sql "SELECT * FROM qnvip_center_commerce.cc_order WHERE
 - `EXPLAIN`
 - 只读的 `WITH ... SELECT`
 
+用户明确允许并传入 `--allow-write` 后，额外允许：
+
+- `INSERT`
+- `UPDATE`
+- `DELETE`
+- `REPLACE`
+
 会被拦截的示例：
 
-- `INSERT`、`UPDATE`、`DELETE`、`REPLACE`、`MERGE`
+- 未传 `--allow-write` 的 `INSERT`、`UPDATE`、`DELETE`、`REPLACE`
+- `MERGE`
 - `CREATE`、`ALTER`、`DROP`、`TRUNCATE`
 - `GRANT`、`REVOKE`
 - `BEGIN`、`COMMIT`、`ROLLBACK`
@@ -502,9 +546,9 @@ scripts/db-query --check-sql "SELECT * FROM qnvip_center_commerce.cc_order WHERE
 - `SELECT ... FOR UPDATE`
 - 具有副作用或风险的函数，例如 `nextval`、`setval`、`get_lock`、`sleep`、`pg_sleep`、`benchmark`、`dblink_exec`
 
-`SELECT` 和 `WITH` 查询会自动补 `LIMIT 200`，除非 SQL 已经包含 limit，或显式使用 `--no-auto-limit`。
+`SELECT` 和 `WITH` 查询会自动补 `LIMIT 200`，除非 SQL 已经包含 limit，或显式使用 `--no-auto-limit`。DML 不会自动补 limit；Agent 必须使用精确业务键和可审计的 `WHERE` 条件。
 
-配置了 `max_rows` 时，它是硬上限；用户传入更大的 `--limit` 或 SQL 里已有更大的 `LIMIT`，都会被压到 `max_rows`。`readonly=false` 不会启用写 SQL，database-cli 会直接拒绝该配置。
+配置了 `max_rows` 时，它是硬上限；用户传入更大的 `--limit` 或 SQL 里已有更大的 `LIMIT`，都会被压到 `max_rows`。`readonly=false` 不会启用写 SQL，database-cli 会直接拒绝该配置。写 SQL 只能通过单次命令的 `--allow-write` 显式开启。
 
 ## 密码处理
 
@@ -552,13 +596,21 @@ export QA01_DB_PASSWORD='...'
 
 ## 修数 SQL 流程
 
-不要通过这个 Skill 执行任何写 SQL。需要修数时，只输出给人工执行的 SQL，并包含：
+默认不要通过这个 Skill 执行写 SQL。需要修数时，优先输出给人工执行的 SQL，并包含：
 
 - 目标环境
 - 执行前 `SELECT` 校验
 - 变更 SQL
 - 执行后 `SELECT` 验证
 - 回滚或恢复方案
+
+如果用户明确要求并允许 Agent 直接执行修数 SQL，必须满足：
+
+- 使用 `--allow-write` 或 MCP `allow_write=true`
+- 只执行单条 `INSERT`、`UPDATE`、`DELETE` 或 `REPLACE`
+- 先给出执行前 `SELECT` 校验
+- `UPDATE`/`DELETE` 必须有 `WHERE`，且 SQL 必须有精确业务键或主键条件
+- 执行后再跑 `SELECT` 验证
 
 ## 验证
 

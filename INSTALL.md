@@ -4,7 +4,7 @@
 
 ## 目标
 
-把 `database-cli` 安装后配置好，使 Agent 和人类可以通过本地 CLI 执行只读数据库查询、schema 搜索和人工修数 SQL 准备。stdio MCP server 只是可选适配层。
+把 `database-cli` 安装后配置好，使 Agent 和人类可以通过本地 CLI 执行数据库查询、schema 搜索和人工修数 SQL 准备。默认只读；用户明确允许时，可以通过显式开关执行 DML。stdio MCP server 只是可选适配层。
 
 ## 步骤
 
@@ -56,7 +56,7 @@ scripts/install \
 
 4. 如果提示缺少 `sq`，先询问用户是否允许用 Homebrew 安装。
 
-5. 向用户索取数据库连接信息：
+5. 向用户索取数据库连接信息。如果用户只想临时查询，可以不写配置，后续直接把这些信息传给 `scripts/db-query --url ...`：
 
 - 连接链接或 host/domain，例如 `mysql://mysql-qa01.example.internal:3306/dbname`
 - 环境名，例如 `qa01`、`prod`
@@ -74,13 +74,21 @@ scripts/install \
 
 如果用户只给了部分信息，继续向用户询问缺失项。不要猜测连接链接、用户名、密码或访问范围。
 
-6. 生成配置后验证：
+6. 生成配置后先做 Agent 友好的状态检查。这个命令只读本地配置和 `sq` 可用性，不连接数据库：
+
+```bash
+scripts/db-query --setup-status
+```
+
+如果 JSON 里的 `ready=false`，按 `next_actions` 继续处理缺失项。
+
+7. 生成配置后验证环境列表：
 
 ```bash
 scripts/db-query --list-envs
 ```
 
-7. 用非生产环境做最小真实连接验证：
+8. 用非生产环境做最小真实连接验证：
 
 ```bash
 scripts/db-query --env qa01 --sql "SELECT 1"
@@ -88,13 +96,13 @@ scripts/db-query --env qa01 --sql "SELECT 1"
 
 如果只有生产环境可用，只能在用户明确同意后执行 `SELECT 1`。
 
-8. 如果用户或客户端需要 MCP 工具入口，再验证 MCP adapter 可启动：
+9. 如果用户或客户端需要 MCP 工具入口，再验证 MCP adapter 可启动：
 
 ```bash
 printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | scripts/database-mcp
 ```
 
-9. 不要猜测数据库地址、用户名、密码或访问范围。用户未提供时，停止并询问。
+10. 不要猜测数据库地址、用户名、密码或访问范围。用户未提供时，停止并询问。
 
 ## 非交互式示例
 
@@ -117,14 +125,17 @@ scripts/install \
 然后验证：
 
 ```bash
+scripts/db-query --setup-status
 scripts/db-query --list-envs
 ```
 
 ## 安全边界
 
-- 只允许通过 `scripts/db-query` 查询；这是唯一真实执行入口。
+- 只允许通过 `scripts/db-query` 执行 SQL；这是唯一真实执行入口。
+- 首次进入项目或安装后，先运行 `scripts/db-query --setup-status`，按 `next_actions` 处理缺失项。
 - 需要 Agent 结构化工具入口时，使用 `scripts/database-mcp`；它只是适配层，仍然委托 `scripts/db-query` 执行实际查询。
-- 运行中的 Agent 需要新增连接时，优先调用 MCP `add_connection` 工具；调用成功后无需重启 Agent，后续工具调用会读取新配置。
-- 不执行写 SQL。
-- 修数时只输出给人工执行的 SQL。
+- 运行中的 Agent 需要新增连接时，优先调用 MCP `add_connection` 工具；调用成功后无需重启 Agent，后续可先调用 `setup_status` 确认配置已可见。
+- 默认不执行写 SQL。
+- 用户明确允许修改时，才能使用 `--allow-write` 或 MCP `allow_write=true` 执行单条 `INSERT`、`UPDATE`、`DELETE`、`REPLACE`。
+- 未获得用户明确允许时，修数只输出给人工执行的 SQL。
 - 不展示或提交明文密码。

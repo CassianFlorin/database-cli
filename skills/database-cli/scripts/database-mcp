@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, unquote, urlparse
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 DB_QUERY = SKILL_ROOT / "scripts" / "db-query"
 INIT_CONFIG = SKILL_ROOT / "scripts" / "init-config"
-SERVER_VERSION = "0.5.1"
+SERVER_VERSION = "0.6.0"
 
 
 def config_paths(explicit_path=None):
@@ -40,6 +40,24 @@ def tool_schema(config_path=None):
         "description": "Optional path to database-cli connections JSON.",
     }
     env = {"type": "string", "description": "Configured database-cli environment name."}
+    connection_properties = {
+        "url": {
+            "type": "string",
+            "description": "Ad-hoc database URL or host. Supports mysql/postgres/sqlite/duckdb/sqlserver/clickhouse URLs.",
+        },
+        "driver": {
+            "type": "string",
+            "enum": ["mysql", "mariadb", "postgres", "postgresql", "sqlite3", "duckdb", "sqlserver", "clickhouse"],
+        },
+        "host": {"type": "string"},
+        "port": {"type": "integer", "minimum": 0},
+        "database": {"type": "string"},
+        "path": {"type": "string"},
+        "username": {"type": "string"},
+        "password": {"type": "string"},
+        "password_env": {"type": "string"},
+        "max_rows": {"type": "integer", "minimum": 1},
+    }
     base_tools = [
         {
             "name": "add_connection",
@@ -90,6 +108,21 @@ def tool_schema(config_path=None):
             },
         },
         {
+            "name": "setup_status",
+            "description": "Report database-cli setup readiness, configured environments, missing prerequisites, and next actions without querying a database.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "sq_bin": {
+                        "type": "string",
+                        "description": "Optional sq executable path or name to check.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "list_envs",
             "description": "List configured database-cli environments.",
             "inputSchema": {
@@ -106,13 +139,38 @@ def tool_schema(config_path=None):
                 "properties": {
                     "config": common_config,
                     "env": env,
+                    **connection_properties,
                     "sql": {"type": "string", "description": "Read-only SQL statement."},
                     "schema": {"type": "string", "description": "Optional schema/catalog override."},
                     "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
                     "limit": {"type": "integer", "minimum": 0},
                     "no_auto_limit": {"type": "boolean"},
                 },
-                "required": ["env", "sql"],
+                "required": ["sql"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "execute_sql",
+            "description": "Run SQL through database-cli. Defaults to read-only; set allow_write only after explicit user approval for DML.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "env": env,
+                    **connection_properties,
+                    "sql": {"type": "string", "description": "SQL statement."},
+                    "schema": {"type": "string", "description": "Optional schema/catalog override."},
+                    "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
+                    "limit": {"type": "integer", "minimum": 0},
+                    "no_auto_limit": {"type": "boolean"},
+                    "allow_write": {
+                        "type": "boolean",
+                        "description": "Allow DML after explicit user approval. DDL, transactions, procedures, locks, and exports remain blocked.",
+                    },
+                    "print_command": {"type": "boolean"},
+                },
+                "required": ["sql"],
                 "additionalProperties": False,
             },
         },
@@ -124,11 +182,11 @@ def tool_schema(config_path=None):
                 "properties": {
                     "config": common_config,
                     "env": env,
+                    **connection_properties,
                     "target": {"type": "string", "description": "Optional table/source target."},
                     "schema": {"type": "string", "description": "Optional schema/catalog override."},
                     "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
                 },
-                "required": ["env"],
                 "additionalProperties": False,
             },
         },
@@ -140,6 +198,7 @@ def tool_schema(config_path=None):
                 "properties": {
                     "config": common_config,
                     "env": env,
+                    **connection_properties,
                     "pattern": {"type": "string", "description": "SQL LIKE pattern, e.g. %order_no%."},
                     "object_type": {"type": "string", "enum": ["schema", "table", "column", "index", "procedure", "function"]},
                     "detail_level": {"type": "string", "enum": ["names", "summary", "full"]},
@@ -148,7 +207,7 @@ def tool_schema(config_path=None):
                     "format": {"type": "string", "enum": ["json", "csv", "markdown", "text", "yaml"]},
                     "limit": {"type": "integer", "minimum": 0},
                 },
-                "required": ["env", "pattern"],
+                "required": ["pattern"],
                 "additionalProperties": False,
             },
         },
@@ -161,6 +220,7 @@ def tool_schema(config_path=None):
                     "sql": {"type": "string", "description": "SQL statement to validate."},
                     "limit": {"type": "integer", "minimum": 0},
                     "no_auto_limit": {"type": "boolean"},
+                    "allow_write": {"type": "boolean"},
                 },
                 "required": ["sql"],
                 "additionalProperties": False,
@@ -332,8 +392,33 @@ def add_common_args(cmd, args):
         cmd.append("--no-auto-limit")
 
 
+def add_connection_args(cmd, args):
+    option_names = {
+        "url": "--url",
+        "driver": "--driver",
+        "host": "--host",
+        "port": "--port",
+        "database": "--database",
+        "path": "--path",
+        "username": "--username",
+        "password": "--password",
+        "password_env": "--password-env",
+        "max_rows": "--max-rows",
+    }
+    for key, option in option_names.items():
+        if args.get(key) not in (None, ""):
+            cmd.extend([option, str(args[key])])
+
+
 def command_for_tool(name, args):
     cmd = [str(DB_QUERY)]
+    if name == "setup_status":
+        if args.get("config"):
+            cmd.extend(["--config", args["config"]])
+        if args.get("sq_bin"):
+            cmd.extend(["--sq-bin", args["sq_bin"]])
+        cmd.append("--setup-status")
+        return cmd
     if name == "list_envs":
         if args.get("config"):
             cmd.extend(["--config", args["config"]])
@@ -341,17 +426,37 @@ def command_for_tool(name, args):
         return cmd
     if name == "query_readonly":
         add_common_args(cmd, args)
-        cmd.extend(["--env", args["env"], "--sql", args["sql"]])
+        add_connection_args(cmd, args)
+        if args.get("env"):
+            cmd.extend(["--env", args["env"]])
+        cmd.extend(["--sql", args["sql"]])
+        return cmd
+    if name == "execute_sql":
+        add_common_args(cmd, args)
+        add_connection_args(cmd, args)
+        if args.get("allow_write"):
+            cmd.append("--allow-write")
+        if args.get("print_command"):
+            cmd.append("--print-command")
+        if args.get("env"):
+            cmd.extend(["--env", args["env"]])
+        cmd.extend(["--sql", args["sql"]])
         return cmd
     if name == "inspect":
         add_common_args(cmd, args)
-        cmd.extend(["--env", args["env"], "--inspect"])
+        add_connection_args(cmd, args)
+        if args.get("env"):
+            cmd.extend(["--env", args["env"]])
+        cmd.append("--inspect")
         if args.get("target"):
             cmd.append(args["target"])
         return cmd
     if name == "search_objects":
         add_common_args(cmd, args)
-        cmd.extend(["--env", args["env"], "--search-objects", args["pattern"]])
+        add_connection_args(cmd, args)
+        if args.get("env"):
+            cmd.extend(["--env", args["env"]])
+        cmd.extend(["--search-objects", args["pattern"]])
         if args.get("object_type"):
             cmd.extend(["--object-type", args["object_type"]])
         if args.get("detail_level"):
@@ -364,6 +469,8 @@ def command_for_tool(name, args):
             cmd.extend(["--limit", str(args["limit"])])
         if args.get("no_auto_limit"):
             cmd.append("--no-auto-limit")
+        if args.get("allow_write"):
+            cmd.append("--allow-write")
         cmd.extend(["--check-sql", args["sql"]])
         return cmd
     raise ValueError(f"Unknown tool '{name}'.")

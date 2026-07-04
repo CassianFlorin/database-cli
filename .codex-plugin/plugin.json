@@ -1,7 +1,7 @@
 {
   "name": "database-cli",
-  "version": "0.5.1",
-  "description": "CLI-first read-only database investigation Skill.",
+  "version": "0.6.0",
+  "description": "CLI-first database investigation Skill with read-only defaults and explicit write opt-in.",
   "author": {
     "name": "Cassian Florin",
     "url": "https://github.com/CassianFlorin"
@@ -16,13 +16,14 @@
     "mcp",
     "sq",
     "query",
-    "read-only"
+    "read-only",
+    "write-opt-in"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Database CLI",
     "shortDescription": "CLI-first database investigation Skill",
-    "longDescription": "Use Database CLI to inspect database schema, search metadata across visible schemas, run safe read-only SQL, compare records across environments, and produce human-reviewed repair SQL through the local CLI workflow. MCP is an optional adapter over the same CLI.",
+    "longDescription": "Use Database CLI to inspect database schema, search metadata across visible schemas, run safe SQL with read-only defaults, compare records across environments, and produce or execute explicitly approved repair SQL through the local CLI workflow. MCP is an optional adapter over the same CLI.",
     "developerName": "Cassian Florin",
     "category": "Productivity",
     "capabilities": [
@@ -32,7 +33,7 @@
     ],
     "defaultPrompt": [
       "Use Database CLI to inspect a database schema.",
-      "Use Database CLI to run a safe read-only SQL query."
+      "Use Database CLI to run safe SQL with read-only defaults and explicit write opt-in."
     ],
     "brandColor": "#2563EB"
   }

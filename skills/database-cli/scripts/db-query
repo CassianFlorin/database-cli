@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse
 
 
 DEFAULT_LIMIT = 200
@@ -21,6 +21,7 @@ DEFAULT_CONFIG_PATHS = [
 ]
 
 ALLOWED_FIRST_TOKENS = {"select", "show", "desc", "describe", "explain", "with"}
+DML_FIRST_TOKENS = {"insert", "update", "delete", "replace"}
 FORBIDDEN_KEYWORDS = {
     "alter",
     "begin",
@@ -176,7 +177,7 @@ def first_token(cleaned_sql):
     return match.group(0).lower() if match else ""
 
 
-def validate_sql(sql):
+def validate_sql(sql, allow_write=False):
     cleaned = strip_comments_and_literals(sql)
     statements = nonempty_statements(cleaned)
     if len(statements) != 1:
@@ -184,12 +185,22 @@ def validate_sql(sql):
 
     statement = statements[0]
     token = first_token(statement)
-    if token not in ALLOWED_FIRST_TOKENS:
+    allowed_tokens = ALLOWED_FIRST_TOKENS | (DML_FIRST_TOKENS if allow_write else set())
+    if token not in allowed_tokens:
+        if allow_write:
+            allowed = ", ".join(sorted(allowed_tokens))
+            raise UnsafeSqlError(f"SQL must start with an allowed token: {allowed}.")
         allowed = ", ".join(sorted(ALLOWED_FIRST_TOKENS))
         raise UnsafeSqlError(f"SQL must start with a read-only token: {allowed}.")
 
     words = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", statement.lower()))
-    blocked = sorted(words & FORBIDDEN_KEYWORDS)
+    if allow_write and token in {"update", "delete"} and "where" not in words:
+        raise UnsafeSqlError(f"{token.upper()} requires a WHERE clause when --allow-write is used.")
+
+    forbidden = FORBIDDEN_KEYWORDS - (DML_FIRST_TOKENS if allow_write else set())
+    if allow_write and token == "update":
+        forbidden = forbidden - {"set"}
+    blocked = sorted(words & forbidden)
     if blocked:
         raise UnsafeSqlError(f"SQL contains blocked keyword(s): {', '.join(blocked)}.")
 
@@ -469,6 +480,219 @@ def load_config(explicit_path):
                 return json.load(handle), path
     paths = ", ".join(str(path) for path in config_paths(explicit_path))
     raise ConfigError(f"No config file found. Checked: {paths}")
+
+
+def parse_database_url(raw_url):
+    if not raw_url:
+        return {}
+    if "://" not in raw_url:
+        return {"host": raw_url}
+
+    parsed = urlparse(raw_url)
+    values = {}
+    if parsed.scheme:
+        scheme = parsed.scheme.lower()
+        values["driver"] = "sqlite3" if scheme == "sqlite" else scheme
+    if parsed.hostname:
+        values["host"] = parsed.hostname
+    if parsed.port:
+        values["port"] = parsed.port
+    if parsed.username:
+        values["username"] = unquote(parsed.username)
+    if parsed.password:
+        values["password"] = unquote(parsed.password)
+
+    path = unquote(parsed.path.lstrip("/"))
+    if path:
+        if values.get("driver") in {"sqlite3", "duckdb"}:
+            values["path"] = unquote(parsed.path)
+        else:
+            values["database"] = path
+
+    params = {key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
+    if params:
+        values["params"] = params
+    return values
+
+
+AD_HOC_CONNECTION_FIELDS = {
+    "url",
+    "driver",
+    "host",
+    "port",
+    "database",
+    "path",
+    "username",
+    "password",
+    "password_env",
+}
+
+
+def has_ad_hoc_connection(args):
+    return any(getattr(args, field, None) not in (None, "") for field in AD_HOC_CONNECTION_FIELDS)
+
+
+def build_ad_hoc_env(args):
+    parsed = parse_database_url(args.url)
+    values = dict(parsed)
+    for field in AD_HOC_CONNECTION_FIELDS - {"url"}:
+        value = getattr(args, field, None)
+        if value not in (None, ""):
+            values[field] = value
+    if args.schema:
+        values["schema"] = args.schema
+    if args.max_rows is not None:
+        values["max_rows"] = args.max_rows
+
+    driver = str(values.get("driver") or "mysql").lower()
+    values["driver"] = driver
+    if driver in {"sqlite", "sqlite3", "duckdb"}:
+        if not values.get("path") and not values.get("database"):
+            raise ConfigError("Ad-hoc sqlite3/duckdb connections require --path or a file URL.")
+    elif not values.get("host"):
+        raise ConfigError("Ad-hoc database connections require --url or --host.")
+    return values
+
+
+def runtime_connection(args):
+    if args.env:
+        config, path = load_config(args.config)
+        env_name, env = get_env(config, args.env)
+        return config, path, env_name, env
+    if has_ad_hoc_connection(args):
+        env = build_ad_hoc_env(args)
+        return {}, None, "adhoc", env
+    raise ConfigError("Missing --env or ad-hoc connection details. Use --list-envs or provide --url/--host with credentials.")
+
+
+def setup_status(args):
+    checked_paths = [str(path) for path in config_paths(args.config)]
+    config = None
+    config_path = None
+    config_error = None
+    ad_hoc_error = None
+
+    for path in config_paths(args.config):
+        if path.exists():
+            config_path = path
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    config = json.load(handle)
+            except json.JSONDecodeError as exc:
+                config_error = str(exc)
+            break
+
+    if has_ad_hoc_connection(args):
+        try:
+            envs = {"adhoc": build_ad_hoc_env(args)}
+        except ConfigError as exc:
+            envs = {}
+            ad_hoc_error = str(exc)
+    elif isinstance(config, dict):
+        envs = config.get("environments", {}) or {}
+        if not isinstance(envs, dict):
+            envs = {}
+    else:
+        envs = {}
+
+    sq_available = shutil.which(args.sq_bin) is not None
+    problems = []
+    if not sq_available:
+        problems.append(
+            {
+                "code": "missing_sq",
+                "message": f"'{args.sq_bin}' is not available. Install sq before running real database queries.",
+            }
+        )
+    if ad_hoc_error:
+        problems.append(
+            {
+                "code": "invalid_ad_hoc_connection",
+                "message": ad_hoc_error,
+            }
+        )
+    if config_path is None and not has_ad_hoc_connection(args):
+        problems.append(
+            {
+                "code": "missing_config",
+                "message": "No database-cli connection config was found.",
+            }
+        )
+    elif config_error and not has_ad_hoc_connection(args):
+        problems.append(
+            {
+                "code": "invalid_config",
+                "message": f"Config JSON is invalid: {config_error}",
+            }
+        )
+    elif not envs:
+        problems.append(
+            {
+                "code": "no_environments",
+                "message": "Connection config exists but has no environments.",
+            }
+        )
+
+    connections = [
+        connection_summary(name, envs[name])
+        for name in sorted(envs)
+    ]
+    ready = sq_available and not ad_hoc_error and (has_ad_hoc_connection(args) or (config_path is not None and not config_error)) and bool(envs)
+
+    next_actions = []
+    if ready:
+        next_actions.extend(
+            [
+                {
+                    "label": "List configured environments",
+                    "command": "scripts/db-query --list-envs",
+                },
+                {
+                    "label": "Run a minimal read-only smoke query after confirming the target environment",
+                    "command": "scripts/db-query --env <env> --sql \"SELECT 1\"",
+                },
+            ]
+        )
+    else:
+        if not sq_available:
+            next_actions.append(
+                {
+                    "label": "Install sq",
+                    "command": "brew install sq",
+                }
+            )
+        if (config_path is None and not has_ad_hoc_connection(args)) or not envs:
+            next_actions.append(
+                {
+                    "label": "Create the first read-only connection",
+                    "command": (
+                        "scripts/install --env <env> --url <database-url-or-host> "
+                        "--username <readonly-user> --password-env <ENV_DB_PASSWORD> --non-interactive"
+                    ),
+                }
+            )
+
+    status = {
+        "ready": ready,
+        "sq_available": sq_available,
+        "config": {
+            "exists": config_path is not None and config_error is None,
+            "path": str(config_path) if config_path else checked_paths[0],
+            "checked_paths": checked_paths,
+            "required": not has_ad_hoc_connection(args),
+        },
+        "environments": sorted(envs),
+        "connections": connections,
+        "problems": problems,
+        "next_actions": next_actions,
+        "agent_guidance": [
+            "Start with setup_status before asking the user for database details.",
+            "If ready is false, ask only for the facts needed by next_actions.",
+            "Use search_objects for metadata discovery before querying table data.",
+            "Use query_readonly or scripts/db-query for bounded read-only SQL only; output repair SQL for humans to execute.",
+        ],
+    }
+    return status
 
 
 def get_env(config, env_name):
@@ -899,6 +1123,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run safe read-only database CLI queries through sq.")
     parser.add_argument("--config", help="Path to connections JSON.")
     parser.add_argument("--env", help="Configured environment name.")
+    parser.add_argument("--url", help="Ad-hoc database URL or host/domain supplied by the user.")
+    parser.add_argument("--driver", choices=["mysql", "mariadb", "postgres", "postgresql", "sqlite3", "duckdb", "sqlserver", "clickhouse"], help="Ad-hoc database driver. Defaults to mysql when --host or a host-only --url is used.")
+    parser.add_argument("--host", help="Ad-hoc database host/domain.")
+    parser.add_argument("--port", type=int, help="Ad-hoc database port.")
+    parser.add_argument("--database", help="Ad-hoc default database/catalog.")
+    parser.add_argument("--path", help="Ad-hoc SQLite/DuckDB file path.")
+    parser.add_argument("--username", help="Ad-hoc database username.")
+    parser.add_argument("--password", help="Ad-hoc local password; prefer --password-env when possible.")
+    parser.add_argument("--password-env", help="Environment variable containing the ad-hoc database password.")
     parser.add_argument("--schema", help="Override schema/catalog for this call.")
     parser.add_argument("--sql", help="Read-only SQL statement to execute.")
     parser.add_argument("--check-sql", help="Validate SQL safety without executing.")
@@ -907,10 +1140,13 @@ def parse_args():
     parser.add_argument("--object-type", choices=["schema", "table", "column", "index", "procedure", "function"], default="table")
     parser.add_argument("--detail-level", choices=["names", "summary", "full"], default="summary")
     parser.add_argument("--table", help="Limit column/index metadata search to one table.")
+    parser.add_argument("--setup-status", action="store_true", help="Print Agent-friendly setup status and next actions without querying a database.")
     parser.add_argument("--list-envs", action="store_true", help="List configured environments.")
     parser.add_argument("--format", choices=["json", "csv", "markdown", "text", "yaml"], default="json")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Default row limit for SELECT/WITH queries.")
+    parser.add_argument("--max-rows", type=int, help="Hard maximum rows for ad-hoc SELECT/WITH queries.")
     parser.add_argument("--no-auto-limit", action="store_true", help="Do not append LIMIT to SELECT/WITH queries.")
+    parser.add_argument("--allow-write", action="store_true", help="Allow DML SQL after explicit user approval. DDL, transactions, procedures, locks, exports, and other side effects remain blocked.")
     parser.add_argument("--print-command", action="store_true", help="Print the sq command instead of executing it.")
     parser.add_argument("--sq-bin", default="sq", help="sq executable path or name.")
     parser.add_argument("--timeout", type=int, default=60, help="Command timeout in seconds.")
@@ -921,15 +1157,18 @@ def main():
     args = parse_args()
 
     try:
+        if args.setup_status:
+            print(json.dumps(setup_status(args), ensure_ascii=False))
+            return 0
+
         if args.check_sql:
-            _, token = validate_sql(args.check_sql)
+            _, token = validate_sql(args.check_sql, allow_write=args.allow_write)
             limited = maybe_add_limit(args.check_sql, token, args.limit, "limit", args.no_auto_limit)
             print(limited)
             return 0
 
-        config, path = load_config(args.config)
-
         if args.list_envs:
+            config, path = load_config(args.config)
             envs = config.get("environments", {})
             connections = [
                 connection_summary(name, envs[name])
@@ -938,15 +1177,12 @@ def main():
             print(json.dumps({"config": str(path), "environments": sorted(envs), "connections": connections}, ensure_ascii=False))
             return 0
 
-        if not args.env:
-            raise ConfigError("Missing --env. Use --list-envs to see configured environments.")
-
-        env_name, env = get_env(config, args.env)
+        config, path, env_name, env = runtime_connection(args)
         enforce_readonly(config, env, env_name)
         max_rows = configured_max_rows(config, env)
 
         if args.sql:
-            _, token = validate_sql(args.sql)
+            _, token = validate_sql(args.sql, allow_write=args.allow_write)
             sql = maybe_add_limit_with_cap(
                 args.sql,
                 token,
@@ -959,7 +1195,7 @@ def main():
             cmd = build_sql_command(args, config, env, sql, source, sq_config)
         elif args.search_objects:
             search_sql = build_search_objects_sql(env, args)
-            _, token = validate_sql(search_sql)
+            _, token = validate_sql(search_sql, allow_write=False)
             sql = maybe_add_limit_with_cap(
                 search_sql,
                 token,
