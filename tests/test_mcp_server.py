@@ -269,6 +269,34 @@ class McpServerTest(unittest.TestCase):
         self.assertNotIn("DELETE", stdout)
         self.assertNotIn("local-secret", stdout)
 
+    def test_generate_rollback_passes_key_columns(self):
+        responses = self.call_server(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "generate_rollback",
+                        "arguments": {
+                            "url": "mysql://mysql-adhoc.example.internal:3306/qnvip_center_order",
+                            "username": "readonly_user",
+                            "sql": "UPDATE cc_order SET status = 1 WHERE id = 10",
+                            "key_columns": "id",
+                            "print_command": True,
+                        },
+                    },
+                }
+            ]
+        )
+
+        result = responses[0]["result"]
+        self.assertEqual(result["structuredContent"]["exit_code"], 0)
+        stdout = result["structuredContent"]["stdout"]
+        # print_command derives the read-only impact SELECTs, not the DML.
+        self.assertIn("SELECT COUNT(*) AS affected_rows FROM cc_order WHERE id = 10", stdout)
+        self.assertNotIn("UPDATE", stdout)
+
     def test_lists_configured_custom_tool(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self.write_config(

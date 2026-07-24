@@ -194,6 +194,26 @@ def tool_schema(config_path=None):
             },
         },
         {
+            "name": "generate_rollback",
+            "description": "Generate (never execute) rollback SQL for an UPDATE/DELETE from the current before-image. UPDATE restores old values (requires key_columns); DELETE re-inserts the rows. Output is for human review.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "env": env,
+                    **connection_properties,
+                    "sql": {"type": "string", "description": "Single-statement UPDATE/DELETE with a WHERE clause, targeting one unaliased table."},
+                    "key_columns": {"type": "string", "description": "Comma-separated key column(s) uniquely identifying a row. Required for UPDATE rollback."},
+                    "schema": {"type": "string", "description": "Optional schema/catalog override."},
+                    "limit": {"type": "integer", "minimum": 0},
+                    "no_auto_limit": {"type": "boolean"},
+                    "print_command": {"type": "boolean"},
+                },
+                "required": ["sql"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "inspect",
             "description": "Inspect a database source or one table through database-cli.",
             "inputSchema": {
@@ -469,6 +489,17 @@ def command_for_tool(name, args):
         if args.get("env"):
             cmd.extend(["--env", args["env"]])
         cmd.extend(["--preview-write", args["sql"]])
+        return cmd
+    if name == "generate_rollback":
+        add_common_args(cmd, args)
+        add_connection_args(cmd, args)
+        if args.get("print_command"):
+            cmd.append("--print-command")
+        if args.get("key_columns"):
+            cmd.extend(["--key-columns", args["key_columns"]])
+        if args.get("env"):
+            cmd.extend(["--env", args["env"]])
+        cmd.extend(["--generate-rollback", args["sql"]])
         return cmd
     if name == "inspect":
         add_common_args(cmd, args)

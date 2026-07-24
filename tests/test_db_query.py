@@ -686,5 +686,138 @@ class PreviewWriteTest(unittest.TestCase):
             self.assertFalse(entry["allow_write"])
 
 
+class GenerateRollbackTest(unittest.TestCase):
+    def write_config(self, tmpdir, env):
+        config = Path(tmpdir) / "connections.local.json"
+        config.write_text(json.dumps({"environments": {"qa01": env}}), encoding="utf-8")
+        return config
+
+    def make_fake_sq(self, tmpdir, rows, count=None):
+        """Fake sq: COUNT queries return the count; snapshot queries return rows."""
+        count = len(rows) if count is None else count
+        script = (
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            f"rows = json.loads(r'''{json.dumps(rows)}''')\n"
+            f"count = {count}\n"
+            "sql = sys.argv[-1] if len(sys.argv) > 1 else ''\n"
+            "if 'COUNT(*)' in sql:\n"
+            "    print(json.dumps([{'affected_rows': count}]))\n"
+            "else:\n"
+            "    print(json.dumps(rows))\n"
+        )
+        fake = Path(tmpdir) / "fake-sq"
+        fake.write_text(script, encoding="utf-8")
+        fake.chmod(0o755)
+        return fake
+
+    def run_rollback(self, tmpdir, dml, rows, count=None, extra=None, env=None):
+        env = env or {"source": "@qa01", "driver": "mysql"}
+        config = self.write_config(tmpdir, env)
+        fake = self.make_fake_sq(tmpdir, rows, count)
+        audit = Path(tmpdir) / "audit.log"
+        cmd = [
+            str(DB_QUERY), "--config", str(config), "--env", "qa01",
+            "--sq-bin", str(fake), "--audit-log", str(audit),
+            "--generate-rollback", dml,
+        ]
+        if extra:
+            cmd.extend(extra)
+        result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        return result, audit
+
+    def test_update_rollback_restores_old_values_scoped_by_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [{"id": 1, "order_no": "YP1", "status": 0}, {"id": 2, "order_no": "YP2", "status": 0}]
+            result, audit = self.run_rollback(
+                tmpdir,
+                "UPDATE cc_order SET status = 9 WHERE status = 0",
+                rows,
+                extra=["--key-columns", "id"],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            envelope = json.loads(result.stdout)
+            self.assertTrue(envelope["rollback"])
+            self.assertFalse(envelope["executed"])
+            self.assertEqual(envelope["table"], "cc_order")
+            self.assertEqual(envelope["set_columns"], ["status"])
+            self.assertEqual(
+                envelope["rollback_sql"],
+                [
+                    "UPDATE cc_order SET status = 0 WHERE id = 1;",
+                    "UPDATE cc_order SET status = 0 WHERE id = 2;",
+                ],
+            )
+            entry = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(entry["event"], "generate_rollback")
+            self.assertEqual(entry["mode"], "read")
+
+    def test_delete_rollback_reinserts_rows_with_nulls_and_quotes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [{"id": 1, "note": None}, {"id": 2, "note": "a'b"}]
+            result, _ = self.run_rollback(tmpdir, "DELETE FROM cc_order WHERE id IN (1, 2)", rows)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            envelope = json.loads(result.stdout)
+            self.assertEqual(
+                envelope["rollback_sql"],
+                [
+                    "INSERT INTO cc_order (id, note) VALUES (1, NULL);",
+                    "INSERT INTO cc_order (id, note) VALUES (2, 'a''b');",
+                ],
+            )
+
+    def test_update_rollback_requires_key_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self.run_rollback(
+                tmpdir, "UPDATE cc_order SET status = 9 WHERE id = 1", [{"id": 1, "status": 0}]
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("key-columns", result.stderr)
+
+    def test_insert_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self.run_rollback(tmpdir, "INSERT INTO t (a) VALUES (1)", [])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("UPDATE and DELETE", result.stderr)
+
+    def test_aliased_or_joined_table_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self.run_rollback(
+                tmpdir,
+                "DELETE o FROM cc_order o WHERE o.id = 1",
+                [{"id": 1}],
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("single", result.stderr.lower())
+
+    def test_partial_rollback_is_refused_when_snapshot_truncated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self.run_rollback(
+                tmpdir,
+                "DELETE FROM cc_order WHERE status = 0",
+                [{"id": 1, "status": 0}],
+                count=5,
+                extra=["--max-rows", "1"],
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("partial rollback", result.stderr.lower())
+
+    def test_composite_key_and_multi_column_set(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [{"tenant": 7, "id": 1, "a": "x", "b": 2}]
+            result, _ = self.run_rollback(
+                tmpdir,
+                "UPDATE t SET a = 'new', b = 9 WHERE id = 1",
+                rows,
+                extra=["--key-columns", "tenant,id"],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            envelope = json.loads(result.stdout)
+            self.assertEqual(
+                envelope["rollback_sql"],
+                ["UPDATE t SET a = 'x', b = 2 WHERE tenant = 7 AND id = 1;"],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

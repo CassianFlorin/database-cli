@@ -265,6 +265,115 @@ def parse_write_target(sql, token):
     return from_expr, where_expr
 
 
+def simple_table(from_expr):
+    """Return a single, unaliased table reference, or None.
+
+    Accepts `t`, `db.t`, and backtick/bracket-quoted variants. Rejects
+    JOINs, aliases, comma lists, and subqueries — shapes for which an
+    INSERT/UPDATE rollback target would be ambiguous.
+    """
+    expr = from_expr.strip().rstrip(";").strip()
+    if not expr or re.search(r"\s", expr) or "," in expr or "(" in expr:
+        return None
+    return expr
+
+
+def bare_column_name(text):
+    """Reduce a SET/where target like `` t.`status` `` to `status`."""
+    token = text.strip().split(".")[-1].strip().strip("`[]\"")
+    match = re.match(r"[\w$]+", token)
+    return match.group(0) if match else None
+
+
+def parse_update_set_columns(sql):
+    """Return the bare column names assigned in an UPDATE's SET clause."""
+    cleaned = strip_comments_and_literals(sql)
+    set_span = keyword_span_depth0(cleaned, "set")
+    where_span = keyword_span_depth0(cleaned, "where")
+    if not set_span or not where_span or set_span[1] > where_span[0]:
+        return None
+    region_start, region_end = set_span[1], where_span[0]
+    region_cleaned = cleaned[region_start:region_end]
+
+    boundaries = [0]
+    depth = 0
+    for i, ch in enumerate(region_cleaned):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            boundaries.append(i + 1)
+    boundaries.append(len(region_cleaned) + 1)
+
+    columns = []
+    for idx in range(len(boundaries) - 1):
+        seg_start = boundaries[idx]
+        seg_end = boundaries[idx + 1] - 1
+        seg_cleaned = region_cleaned[seg_start:seg_end]
+        eq = seg_cleaned.find("=")
+        if eq == -1:
+            return None
+        col_original = sql[region_start + seg_start:region_start + seg_start + eq]
+        name = bare_column_name(col_original)
+        if not name:
+            return None
+        columns.append(name)
+    return columns
+
+
+def sql_value_literal(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    return sql_literal(str(value))
+
+
+def key_predicate(column, value):
+    if value is None:
+        return f"{column} IS NULL"
+    return f"{column} = {sql_value_literal(value)}"
+
+
+def build_update_rollback(table, set_columns, key_columns, rows):
+    statements = []
+    for row in rows:
+        set_parts = []
+        for col in set_columns:
+            if col not in row:
+                raise UnsafeSqlError(
+                    f"SET column '{col}' is absent from the snapshot; cannot build a rollback."
+                )
+            set_parts.append(f"{col} = {sql_value_literal(row[col])}")
+        where_parts = []
+        for key in key_columns:
+            if key not in row:
+                raise UnsafeSqlError(
+                    f"Key column '{key}' is absent from the snapshot; cannot build a rollback."
+                )
+            where_parts.append(key_predicate(key, row[key]))
+        statements.append(
+            f"UPDATE {table} SET {', '.join(set_parts)} WHERE {' AND '.join(where_parts)};"
+        )
+    return statements
+
+
+def build_delete_rollback(table, rows):
+    statements = []
+    for row in rows:
+        columns = list(row.keys())
+        values = [sql_value_literal(row[col]) for col in columns]
+        statements.append(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(values)});"
+        )
+    return statements
+
+
 def maybe_add_limit(sql, token, limit, limit_style, no_auto_limit):
     return maybe_add_limit_with_cap(sql, token, limit, limit_style, no_auto_limit, None)
 
@@ -1061,7 +1170,9 @@ def emit_audit(args, config, env, env_name, *, event, statement, token, allow_wr
         "event": event,
         "env": None if env_name == "adhoc" else env_name,
         "adhoc": env_name == "adhoc",
-        "mode": "write" if token in DML_FIRST_TOKENS and event != "preview_write" else "read",
+        # Only the "sql" event actually executes the statement; preview_write
+        # and generate_rollback analyze a DML token but run read-only SELECTs.
+        "mode": "write" if event == "sql" and token in DML_FIRST_TOKENS else "read",
         "token": token,
         "statement": redact(statement, env_secrets(env)) if statement else statement,
         "allow_write": bool(allow_write),
@@ -1256,6 +1367,8 @@ def parse_args():
     parser.add_argument("--sql", help="Read-only SQL statement to execute.")
     parser.add_argument("--check-sql", help="Validate SQL safety without executing.")
     parser.add_argument("--preview-write", help="Preview an UPDATE/DELETE's impact without executing it: reports affected-row count and a bounded before-snapshot of the matched rows.")
+    parser.add_argument("--generate-rollback", help="Generate (do not execute) rollback SQL for an UPDATE/DELETE from the current before-image. UPDATE restores old values; DELETE re-inserts the rows.")
+    parser.add_argument("--key-columns", help="Comma-separated key column(s) that uniquely identify a row, used to scope UPDATE rollback statements. Required with --generate-rollback for UPDATE.")
     parser.add_argument("--inspect", nargs="?", const="", help="Inspect a source or table.")
     parser.add_argument("--search-objects", help="Search schema/table/column/index/procedure metadata with a SQL LIKE pattern.")
     parser.add_argument("--object-type", choices=["schema", "table", "column", "index", "procedure", "function"], default="table")
@@ -1294,26 +1407,61 @@ def parse_count_result(stdout):
         return None
 
 
-def preview_write(args, config, env, env_name, max_rows):
-    statement, token = validate_sql(args.preview_write, allow_write=True)
-    if token not in {"update", "delete"}:
-        raise UnsafeSqlError("--preview-write supports UPDATE and DELETE statements only.")
-    target = parse_write_target(args.preview_write, token)
-    if not target:
-        raise UnsafeSqlError(
-            "Could not extract a top-level WHERE target from the statement. "
-            "Preview supports single-statement UPDATE/DELETE with a WHERE clause."
-        )
-    from_expr, where_expr = target
+def derive_impact_sql(args, env, from_expr, where_expr, max_rows):
+    """Build read-only COUNT and before-snapshot SELECTs for a write target."""
     count_sql = f"SELECT COUNT(*) AS affected_rows FROM {from_expr} WHERE {where_expr}"
     snapshot_sql = f"SELECT * FROM {from_expr} WHERE {where_expr}"
-    # The reconstructed statements must themselves pass read-only validation.
     validate_sql(count_sql, allow_write=False)
     validate_sql(snapshot_sql, allow_write=False)
     limit_style = env.get("limit_style", "limit")
     snapshot_sql = maybe_add_limit_with_cap(
         snapshot_sql, "select", args.limit, limit_style, args.no_auto_limit, max_rows
     )
+    return count_sql, snapshot_sql
+
+
+def print_setup_prefix(setup, env):
+    if isinstance(setup, tuple):
+        prefix, setup_cmd = setup
+        print(prefix + redact(shlex.join(setup_cmd), env_secrets(env)))
+        print("&&")
+    elif isinstance(setup, list):
+        print(redact(shlex.join(setup), env_secrets(env)))
+        print("&&")
+
+
+def run_impact(count_cmd, snapshot_cmd, secrets, timeout):
+    """Run COUNT then before-snapshot. Returns (rc, affected, rows, err_text)."""
+    count_rc, count_out, count_err = run_capture(count_cmd, timeout, secrets)
+    if count_rc != 0:
+        return count_rc, None, None, (count_err or count_out)
+    affected = parse_count_result(count_out)
+    snap_rc, snap_out, snap_err = run_capture(snapshot_cmd, timeout, secrets)
+    if snap_rc != 0:
+        return snap_rc, affected, None, (snap_err or snap_out)
+    try:
+        rows = json.loads(snap_out)
+    except json.JSONDecodeError:
+        rows = []
+    return 0, affected, rows, None
+
+
+def parse_write_or_raise(statement, flag_name):
+    _, token = validate_sql(statement, allow_write=True)
+    if token not in {"update", "delete"}:
+        raise UnsafeSqlError(f"{flag_name} supports UPDATE and DELETE statements only.")
+    target = parse_write_target(statement, token)
+    if not target:
+        raise UnsafeSqlError(
+            "Could not extract a top-level WHERE target from the statement. "
+            f"{flag_name} supports single-statement UPDATE/DELETE with a WHERE clause."
+        )
+    return token, target[0], target[1]
+
+
+def preview_write(args, config, env, env_name, max_rows):
+    token, from_expr, where_expr = parse_write_or_raise(args.preview_write, "--preview-write")
+    count_sql, snapshot_sql = derive_impact_sql(args, env, from_expr, where_expr, max_rows)
 
     source, sq_config, setup = prepare_source(args, config, env, env_name)
     try:
@@ -1321,13 +1469,7 @@ def preview_write(args, config, env, env_name, max_rows):
         snapshot_cmd = build_sql_command(args, config, env, snapshot_sql, source, sq_config, fmt="json")
 
         if args.print_command:
-            if isinstance(setup, tuple):
-                prefix, setup_cmd = setup
-                print(prefix + redact(shlex.join(setup_cmd), env_secrets(env)))
-                print("&&")
-            elif isinstance(setup, list):
-                print(redact(shlex.join(setup), env_secrets(env)))
-                print("&&")
+            print_setup_prefix(setup, env)
             print(shlex.join(count_cmd))
             print(shlex.join(snapshot_cmd))
             return 0
@@ -1337,36 +1479,23 @@ def preview_write(args, config, env, env_name, max_rows):
         exit_code = None
         affected = None
         try:
-            count_rc, count_out, count_err = run_capture(count_cmd, args.timeout, secrets)
-            if count_rc != 0:
-                sys.stderr.write(count_err or count_out)
-                exit_code = count_rc
-                return count_rc
-            affected = parse_count_result(count_out)
-
-            snap_rc, snap_out, snap_err = run_capture(snapshot_cmd, args.timeout, secrets)
-            if snap_rc != 0:
-                sys.stderr.write(snap_err or snap_out)
-                exit_code = snap_rc
-                return snap_rc
-
-            try:
-                snapshot_rows = json.loads(snap_out)
-            except json.JSONDecodeError:
-                snapshot_rows = []
-            truncated = bool(max_rows and affected is not None and affected > len(snapshot_rows))
-
+            rc, affected, rows, err = run_impact(count_cmd, snapshot_cmd, secrets, args.timeout)
+            if rc != 0:
+                sys.stderr.write(err or "")
+                exit_code = rc
+                return rc
+            truncated = bool(max_rows and affected is not None and affected > len(rows))
             envelope = {
                 "preview": True,
                 "token": token,
                 "from": from_expr,
                 "where": where_expr,
                 "affected_rows": affected,
-                "snapshot_rows": len(snapshot_rows),
+                "snapshot_rows": len(rows),
                 "snapshot_truncated": truncated,
                 "count_sql": count_sql,
                 "snapshot_sql": snapshot_sql,
-                "snapshot": snapshot_rows,
+                "snapshot": rows,
             }
             print(json.dumps(envelope, ensure_ascii=False))
             exit_code = 0
@@ -1376,6 +1505,99 @@ def preview_write(args, config, env, env_name, max_rows):
                 args, config, env, env_name,
                 event="preview_write",
                 statement=args.preview_write,
+                token=token,
+                allow_write=False,
+                exit_code=exit_code,
+                duration_ms=round((datetime.now() - start).total_seconds() * 1000, 1),
+                extra={"affected_rows": affected},
+            )
+    finally:
+        if isinstance(setup, tempfile.TemporaryDirectory):
+            setup.cleanup()
+
+
+def generate_rollback(args, config, env, env_name, max_rows):
+    token, from_expr, where_expr = parse_write_or_raise(args.generate_rollback, "--generate-rollback")
+    table = simple_table(from_expr)
+    if not table:
+        raise UnsafeSqlError(
+            "Rollback requires a single, unaliased target table (no JOIN, alias, or subquery)."
+        )
+
+    key_columns = []
+    set_columns = None
+    if token == "update":
+        if not args.key_columns:
+            raise UnsafeSqlError(
+                "UPDATE rollback requires --key-columns to scope each restore statement "
+                "to exact rows (e.g. --key-columns id)."
+            )
+        key_columns = [col.strip() for col in args.key_columns.split(",") if col.strip()]
+        if not key_columns:
+            raise UnsafeSqlError("--key-columns must name at least one column.")
+        set_columns = parse_update_set_columns(args.generate_rollback)
+        if not set_columns:
+            raise UnsafeSqlError("Could not parse the SET clause to build a rollback.")
+
+    count_sql, snapshot_sql = derive_impact_sql(args, env, from_expr, where_expr, max_rows)
+
+    source, sq_config, setup = prepare_source(args, config, env, env_name)
+    try:
+        count_cmd = build_sql_command(args, config, env, count_sql, source, sq_config, fmt="json")
+        snapshot_cmd = build_sql_command(args, config, env, snapshot_sql, source, sq_config, fmt="json")
+
+        if args.print_command:
+            print_setup_prefix(setup, env)
+            print(shlex.join(count_cmd))
+            print(shlex.join(snapshot_cmd))
+            return 0
+
+        secrets = env_secrets(env)
+        start = datetime.now()
+        exit_code = None
+        affected = None
+        try:
+            rc, affected, rows, err = run_impact(count_cmd, snapshot_cmd, secrets, args.timeout)
+            if rc != 0:
+                sys.stderr.write(err or "")
+                exit_code = rc
+                return rc
+            if affected is None:
+                raise UnsafeSqlError(
+                    "Could not determine the affected-row count; refusing to build a rollback "
+                    "without a completeness check."
+                )
+            if affected > len(rows):
+                raise UnsafeSqlError(
+                    f"Refusing to build a partial rollback: {affected} rows match but only "
+                    f"{len(rows)} were captured (max_rows cap). Narrow the WHERE clause or raise max_rows."
+                )
+
+            if token == "update":
+                rollback_sql = build_update_rollback(table, set_columns, key_columns, rows)
+            else:
+                rollback_sql = build_delete_rollback(table, rows)
+
+            envelope = {
+                "rollback": True,
+                "token": token,
+                "table": table,
+                "where": where_expr,
+                "affected_rows": affected,
+                "key_columns": key_columns,
+                "set_columns": set_columns,
+                "executed": False,
+                "rollback_sql": rollback_sql,
+                "snapshot": rows,
+            }
+            print(json.dumps(envelope, ensure_ascii=False))
+            exit_code = 0
+            return 0
+        finally:
+            emit_audit(
+                args, config, env, env_name,
+                event="generate_rollback",
+                statement=args.generate_rollback,
                 token=token,
                 allow_write=False,
                 exit_code=exit_code,
@@ -1417,6 +1639,9 @@ def main():
 
         if args.preview_write:
             return preview_write(args, config, env, env_name, max_rows)
+
+        if args.generate_rollback:
+            return generate_rollback(args, config, env, env_name, max_rows)
 
         audit_event = None
         audit_statement = None
