@@ -819,5 +819,129 @@ class GenerateRollbackTest(unittest.TestCase):
             )
 
 
+class RepairTest(unittest.TestCase):
+    def write_config(self, tmpdir, env):
+        config = Path(tmpdir) / "connections.local.json"
+        config.write_text(json.dumps({"environments": {"qa01": env}}), encoding="utf-8")
+        return config
+
+    def make_fake_sq(self, tmpdir, rows, count=None):
+        count = len(rows) if count is None else count
+        script = (
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            f"rows = json.loads(r'''{json.dumps(rows)}''')\n"
+            f"count = {count}\n"
+            "sql = sys.argv[-1] if len(sys.argv) > 1 else ''\n"
+            "if 'COUNT(*)' in sql:\n"
+            "    print(json.dumps([{'affected_rows': count}]))\n"
+            "else:\n"
+            "    print(json.dumps(rows))\n"
+        )
+        fake = Path(tmpdir) / "fake-sq"
+        fake.write_text(script, encoding="utf-8")
+        fake.chmod(0o755)
+        return fake
+
+    def run_repair(self, tmpdir, dml, rows, count=None, extra=None):
+        config = self.write_config(tmpdir, {"source": "@qa01", "driver": "mysql"})
+        fake = self.make_fake_sq(tmpdir, rows, count)
+        audit = Path(tmpdir) / "audit.log"
+        cmd = [
+            str(DB_QUERY), "--config", str(config), "--env", "qa01",
+            "--sq-bin", str(fake), "--audit-log", str(audit),
+            "--repair", dml,
+        ]
+        if extra:
+            cmd.extend(extra)
+        result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        return result, audit
+
+    def test_dry_package_assembles_all_parts_without_executing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [{"id": 1, "status": 0}, {"id": 2, "status": 0}]
+            result, audit = self.run_repair(
+                tmpdir, "UPDATE cc_order SET status = 1 WHERE status = 0", rows,
+                extra=["--key-columns", "id"],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            pkg = json.loads(result.stdout)
+            self.assertTrue(pkg["repair"])
+            self.assertFalse(pkg["executed"])
+            self.assertEqual(pkg["change_sql"], "UPDATE cc_order SET status = 1 WHERE status = 0")
+            self.assertIn("snapshot", pkg["pre_check"])
+            self.assertEqual(
+                pkg["rollback_sql"],
+                ["UPDATE cc_order SET status = 0 WHERE id = 1;", "UPDATE cc_order SET status = 0 WHERE id = 2;"],
+            )
+            self.assertEqual(pkg["post_check_sql"], "SELECT * FROM cc_order WHERE (id = 1) OR (id = 2)")
+            self.assertIn("note", pkg)
+            self.assertNotIn("change_result", pkg)
+            entry = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(entry["event"], "repair")
+            self.assertEqual(entry["mode"], "read")
+            self.assertFalse(entry["executed"])
+
+    def test_executed_path_runs_change_and_post_check(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [{"id": 1, "status": 0}]
+            result, audit = self.run_repair(
+                tmpdir, "UPDATE cc_order SET status = 1 WHERE id = 1", rows,
+                extra=["--key-columns", "id", "--allow-write"],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            pkg = json.loads(result.stdout)
+            self.assertTrue(pkg["executed"])
+            self.assertEqual(pkg["change_result"]["exit_code"], 0)
+            self.assertIn("post_check", pkg)
+            self.assertEqual(pkg["post_check"]["exit_code"], 0)
+            entry = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(entry["mode"], "write")
+            self.assertTrue(entry["executed"])
+
+    def test_delete_repair_uses_remaining_count_post_check(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [{"id": 1, "note": None}]
+            result, _ = self.run_repair(tmpdir, "DELETE FROM cc_order WHERE id = 1", rows)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            pkg = json.loads(result.stdout)
+            self.assertEqual(pkg["rollback_sql"], ["INSERT INTO cc_order (id, note) VALUES (1, NULL);"])
+            self.assertEqual(pkg["post_check_sql"], "SELECT COUNT(*) AS remaining FROM cc_order WHERE id = 1")
+
+    def test_update_repair_requires_key_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self.run_repair(
+                tmpdir, "UPDATE cc_order SET status = 1 WHERE id = 1", [{"id": 1, "status": 0}]
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("key-columns", result.stderr)
+
+    def test_partial_repair_is_refused_when_truncated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self.run_repair(
+                tmpdir, "DELETE FROM cc_order WHERE status = 0",
+                [{"id": 1, "status": 0}], count=9, extra=["--max-rows", "1"],
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("repair package", result.stderr.lower())
+
+    def test_print_command_emits_precheck_snapshot_and_change(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(tmpdir, {"source": "@qa01", "driver": "mysql"})
+            result = subprocess.run(
+                [
+                    str(DB_QUERY), "--config", str(config), "--env", "qa01",
+                    "--no-audit", "--print-command",
+                    "--repair", "DELETE FROM cc_order WHERE id = 7",
+                ],
+                text=True, capture_output=True, check=True,
+            )
+            sq_lines = [line for line in result.stdout.splitlines() if line.startswith("sq ")]
+            self.assertEqual(len(sq_lines), 3, result.stdout)
+            self.assertIn("COUNT(*)", sq_lines[0])
+            self.assertIn("SELECT * FROM cc_order WHERE id = 7", shlex.split(sq_lines[1])[-1])
+            self.assertEqual(shlex.split(sq_lines[2])[-1], "DELETE FROM cc_order WHERE id = 7")
+
+
 if __name__ == "__main__":
     unittest.main()

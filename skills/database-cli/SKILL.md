@@ -197,7 +197,7 @@ scripts/db-query --url "mysql://host/dbname" --username readonly_user --password
 
 6. Summarize only the fields needed to answer the user. Avoid spreading unrelated sensitive data.
 
-7. When the user needs a data repair and has not explicitly approved Agent execution, do not execute it. Return a human-reviewed script package:
+7. When the user needs a data repair and has not explicitly approved Agent execution, do not execute it. Prefer `--repair` (without `--allow-write`) to assemble the human-reviewed package in one call; it returns the target environment, pre-check evidence, change SQL, rollback SQL, post-check SQL, and an explicit not-executed note. Otherwise return the same package:
 
 - target environment and connection name
 - pre-check SQL and current evidence
@@ -244,6 +244,26 @@ The output JSON includes `rollback_sql` (a list of statements), `executed: false
 
 Use this to produce the rollback section of a repair package instead of hand-writing reverse SQL.
 
+## Repair Package
+
+`--repair` orchestrates the pieces above into one command: pre-check, change, rollback (from the same before-image), and post-check. It is read-only by default and prints a complete package for a human to review:
+
+```bash
+scripts/db-query --env qa01 --repair "UPDATE cc_order SET status = 1 WHERE id = 10" --key-columns id
+```
+
+The JSON package contains `pre_check` (affected-row snapshot), `change_sql`, `rollback_sql`, `post_check_sql`, and `executed: false`. For `UPDATE` the post-check re-selects the exact affected rows by key so their new values are visible; for `DELETE` it counts remaining matches (expected 0). This is the human-reviewed script package the Hard Rules require.
+
+With explicit user approval, add `--allow-write` to execute the change and run the post-check in one step:
+
+```bash
+scripts/db-query --env qa01 --allow-write --repair "UPDATE cc_order SET status = 1 WHERE id = 10" --key-columns id
+```
+
+The executed package adds `executed: true`, `change_result` (exit code and driver output), and `post_check` (the after-state rows). The before-image and rollback are captured immediately before the change, so `rollback_sql` matches exactly what was changed. Guards match `--generate-rollback`: single unaliased table, `--key-columns` required for `UPDATE`, and refusal when the matched rows exceed the snapshot cap.
+
+This flow is not transactionally atomic — database-cli runs one statement at a time and does not open a transaction — so a concurrent change between the pre-check and the write is possible. Keep the returned `rollback_sql` until the post-check confirms the intended result.
+
 ## Optional MCP Adapter
 
 When a client needs MCP tools, point it at:
@@ -252,7 +272,7 @@ When a client needs MCP tools, point it at:
 scripts/database-mcp
 ```
 
-The adapter exposes `setup_status`, `add_connection`, `list_envs`, `query_readonly`, `execute_sql`, `preview_write`, `generate_rollback`, `inspect`, `search_objects`, and `check_sql`. `preview_write` reports an UPDATE/DELETE's affected-row count and a bounded before-snapshot without executing it; `generate_rollback` emits (never executes) the reverse SQL from the before-image. Both need no `allow_write`. `setup_status` returns readiness, missing prerequisites, configured environments, and next actions without querying a database. `execute_sql` defaults to read-only and accepts ad-hoc connection fields; pass `allow_write=true` only after explicit user approval for DML. `add_connection` writes config through the same initializer path and lets a running Agent add or update a connection without restart; subsequent tool calls read the updated config. `search_objects` supports schema, table, column, index, procedure, and function metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it only when Agent-native structured calls are useful; CLI remains the source of truth.
+The adapter exposes `setup_status`, `add_connection`, `list_envs`, `query_readonly`, `execute_sql`, `preview_write`, `generate_rollback`, `repair`, `inspect`, `search_objects`, and `check_sql`. `preview_write` reports an UPDATE/DELETE's affected-row count and a bounded before-snapshot without executing it; `generate_rollback` emits (never executes) the reverse SQL from the before-image; `repair` assembles the full pre-check/change/rollback/post-check package and executes only when `allow_write=true`. `preview_write` and `generate_rollback` need no `allow_write`. `setup_status` returns readiness, missing prerequisites, configured environments, and next actions without querying a database. `execute_sql` defaults to read-only and accepts ad-hoc connection fields; pass `allow_write=true` only after explicit user approval for DML. `add_connection` writes config through the same initializer path and lets a running Agent add or update a connection without restart; subsequent tool calls read the updated config. `search_objects` supports schema, table, column, index, procedure, and function metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it only when Agent-native structured calls are useful; CLI remains the source of truth.
 
 If `connections.local.json` has a top-level `tools` object, `scripts/database-mcp` also exposes those parameterized read-only custom tools. Parameters are rendered as SQL literals and then passed through `scripts/db-query`, so the same read-only validator and `max_rows` cap still apply.
 
@@ -294,6 +314,12 @@ Generate rollback SQL for review without executing it:
 scripts/db-query --env qa01 --generate-rollback "UPDATE table_name SET status = 1 WHERE id = 10" --key-columns id
 ```
 
+Assemble a full repair package (pre-check, change, rollback, post-check) without executing:
+
+```bash
+scripts/db-query --env qa01 --repair "UPDATE table_name SET status = 1 WHERE id = 10" --key-columns id
+```
+
 Execute approved DML:
 
 ```bash
@@ -326,9 +352,9 @@ scripts/install --env qa01 --url "mysql://mysql-qa01.example.internal" --usernam
 
 ## Audit Log
 
-Every call that actually reaches a database — `--sql`, `--search-objects`, and `--inspect` — appends one JSON line to a local append-only audit log. Calls that never touch a database (`--setup-status`, `--check-sql`, `--list-envs`, `--print-command`) are not logged. The MCP adapter delegates to `scripts/db-query`, so its executions are audited through the same path.
+Every call that actually reaches a database — `--sql`, `--search-objects`, `--inspect`, `--preview-write`, `--generate-rollback`, and `--repair` — appends one JSON line to a local append-only audit log. Calls that never touch a database (`--setup-status`, `--check-sql`, `--list-envs`, `--print-command`) are not logged. The MCP adapter delegates to `scripts/db-query`, so its executions are audited through the same path.
 
-Each entry records: `ts` (local ISO 8601), `event` (`sql`/`search_objects`/`inspect`), `env` (connection name, or `null` for ad-hoc), `adhoc`, `mode` (`read`/`write`), `token`, `statement` (the executed SQL with the auto-appended limit, secrets redacted), `allow_write`, `exit_code`, `duration_ms`, `user`, and `pid`.
+Each entry records: `ts` (local ISO 8601), `event` (`sql`/`search_objects`/`inspect`/`preview_write`/`generate_rollback`/`repair`), `env` (connection name, or `null` for ad-hoc), `adhoc`, `mode` (`read`/`write`), `token`, `statement` (the executed SQL with the auto-appended limit, secrets redacted), `allow_write`, `exit_code`, `duration_ms`, `user`, and `pid`. Only the actual write path — a `sql` DML execution, or a `repair` run with `--allow-write` — records `mode: "write"`; `preview_write` and `generate_rollback` run read-only SELECTs and record `mode: "read"`.
 
 Default location is `~/.local/state/database-cli/audit.log`. Resolution order:
 

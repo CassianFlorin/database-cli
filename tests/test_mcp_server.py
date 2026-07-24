@@ -297,6 +297,33 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("SELECT COUNT(*) AS affected_rows FROM cc_order WHERE id = 10", stdout)
         self.assertNotIn("UPDATE", stdout)
 
+    def test_repair_defaults_to_readonly_without_allow_write(self):
+        responses = self.call_server(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repair",
+                        "arguments": {
+                            "url": "mysql://mysql-adhoc.example.internal:3306/qnvip_center_order",
+                            "username": "readonly_user",
+                            "sql": "DELETE FROM cc_order WHERE id = 7",
+                            "print_command": True,
+                        },
+                    },
+                }
+            ]
+        )
+
+        result = responses[0]["result"]
+        self.assertEqual(result["structuredContent"]["exit_code"], 0)
+        stdout = result["structuredContent"]["stdout"]
+        self.assertIn("SELECT COUNT(*) AS affected_rows FROM cc_order WHERE id = 7", stdout)
+        self.assertIn("DELETE FROM cc_order WHERE id = 7", stdout)
+        self.assertNotIn("--allow-write", stdout)
+
     def test_lists_configured_custom_tool(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self.write_config(

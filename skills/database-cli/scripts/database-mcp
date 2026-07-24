@@ -214,6 +214,30 @@ def tool_schema(config_path=None):
             },
         },
         {
+            "name": "repair",
+            "description": "Assemble a repair package (pre-check, change, rollback, post-check) for an UPDATE/DELETE. Read-only by default; set allow_write only after explicit user approval to execute the change and run the post-check.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "env": env,
+                    **connection_properties,
+                    "sql": {"type": "string", "description": "Single-statement UPDATE/DELETE with a WHERE clause, targeting one unaliased table."},
+                    "key_columns": {"type": "string", "description": "Comma-separated key column(s). Required for UPDATE repair."},
+                    "schema": {"type": "string", "description": "Optional schema/catalog override."},
+                    "limit": {"type": "integer", "minimum": 0},
+                    "no_auto_limit": {"type": "boolean"},
+                    "allow_write": {
+                        "type": "boolean",
+                        "description": "Execute the change and run the post-check. Only after explicit user approval for DML.",
+                    },
+                    "print_command": {"type": "boolean"},
+                },
+                "required": ["sql"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "inspect",
             "description": "Inspect a database source or one table through database-cli.",
             "inputSchema": {
@@ -500,6 +524,19 @@ def command_for_tool(name, args):
         if args.get("env"):
             cmd.extend(["--env", args["env"]])
         cmd.extend(["--generate-rollback", args["sql"]])
+        return cmd
+    if name == "repair":
+        add_common_args(cmd, args)
+        add_connection_args(cmd, args)
+        if args.get("allow_write"):
+            cmd.append("--allow-write")
+        if args.get("print_command"):
+            cmd.append("--print-command")
+        if args.get("key_columns"):
+            cmd.extend(["--key-columns", args["key_columns"]])
+        if args.get("env"):
+            cmd.extend(["--env", args["env"]])
+        cmd.extend(["--repair", args["sql"]])
         return cmd
     if name == "inspect":
         add_common_args(cmd, args)

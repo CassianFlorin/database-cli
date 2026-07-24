@@ -374,6 +374,21 @@ def build_delete_rollback(table, rows):
     return statements
 
 
+def build_key_disjunction(key_columns, rows):
+    """Build an OR of per-row AND-of-key predicates, to re-select exact rows."""
+    groups = []
+    for row in rows:
+        parts = []
+        for key in key_columns:
+            if key not in row:
+                raise UnsafeSqlError(
+                    f"Key column '{key}' is absent from the snapshot; cannot build a post-check."
+                )
+            parts.append(key_predicate(key, row[key]))
+        groups.append("(" + " AND ".join(parts) + ")")
+    return " OR ".join(groups)
+
+
 def maybe_add_limit(sql, token, limit, limit_style, no_auto_limit):
     return maybe_add_limit_with_cap(sql, token, limit, limit_style, no_auto_limit, None)
 
@@ -1162,7 +1177,7 @@ def write_audit(path, entry):
         print(f"db-query: audit log write failed: {exc}", file=sys.stderr)
 
 
-def emit_audit(args, config, env, env_name, *, event, statement, token, allow_write, exit_code, duration_ms, extra=None):
+def emit_audit(args, config, env, env_name, *, event, mode, statement, token, allow_write, exit_code, duration_ms, extra=None):
     if not audit_enabled(args, config, env):
         return
     entry = {
@@ -1170,9 +1185,7 @@ def emit_audit(args, config, env, env_name, *, event, statement, token, allow_wr
         "event": event,
         "env": None if env_name == "adhoc" else env_name,
         "adhoc": env_name == "adhoc",
-        # Only the "sql" event actually executes the statement; preview_write
-        # and generate_rollback analyze a DML token but run read-only SELECTs.
-        "mode": "write" if event == "sql" and token in DML_FIRST_TOKENS else "read",
+        "mode": mode,
         "token": token,
         "statement": redact(statement, env_secrets(env)) if statement else statement,
         "allow_write": bool(allow_write),
@@ -1368,7 +1381,8 @@ def parse_args():
     parser.add_argument("--check-sql", help="Validate SQL safety without executing.")
     parser.add_argument("--preview-write", help="Preview an UPDATE/DELETE's impact without executing it: reports affected-row count and a bounded before-snapshot of the matched rows.")
     parser.add_argument("--generate-rollback", help="Generate (do not execute) rollback SQL for an UPDATE/DELETE from the current before-image. UPDATE restores old values; DELETE re-inserts the rows.")
-    parser.add_argument("--key-columns", help="Comma-separated key column(s) that uniquely identify a row, used to scope UPDATE rollback statements. Required with --generate-rollback for UPDATE.")
+    parser.add_argument("--key-columns", help="Comma-separated key column(s) that uniquely identify a row, used to scope UPDATE rollback/post-check statements. Required with --generate-rollback or --repair for UPDATE.")
+    parser.add_argument("--repair", help="Assemble a repair package (pre-check, change, rollback, post-check) for an UPDATE/DELETE. Read-only by default; add --allow-write to execute the change and run the post-check.")
     parser.add_argument("--inspect", nargs="?", const="", help="Inspect a source or table.")
     parser.add_argument("--search-objects", help="Search schema/table/column/index/procedure metadata with a SQL LIKE pattern.")
     parser.add_argument("--object-type", choices=["schema", "table", "column", "index", "procedure", "function"], default="table")
@@ -1504,6 +1518,7 @@ def preview_write(args, config, env, env_name, max_rows):
             emit_audit(
                 args, config, env, env_name,
                 event="preview_write",
+                mode="read",
                 statement=args.preview_write,
                 token=token,
                 allow_write=False,
@@ -1597,12 +1612,151 @@ def generate_rollback(args, config, env, env_name, max_rows):
             emit_audit(
                 args, config, env, env_name,
                 event="generate_rollback",
+                mode="read",
                 statement=args.generate_rollback,
                 token=token,
                 allow_write=False,
                 exit_code=exit_code,
                 duration_ms=round((datetime.now() - start).total_seconds() * 1000, 1),
                 extra={"affected_rows": affected},
+            )
+    finally:
+        if isinstance(setup, tempfile.TemporaryDirectory):
+            setup.cleanup()
+
+
+def repair(args, config, env, env_name, max_rows):
+    token, from_expr, where_expr = parse_write_or_raise(args.repair, "--repair")
+    table = simple_table(from_expr)
+    if not table:
+        raise UnsafeSqlError(
+            "Repair requires a single, unaliased target table (no JOIN, alias, or subquery)."
+        )
+
+    key_columns = []
+    set_columns = None
+    if token == "update":
+        if not args.key_columns:
+            raise UnsafeSqlError(
+                "UPDATE repair requires --key-columns to scope rollback and post-check to "
+                "exact rows (e.g. --key-columns id)."
+            )
+        key_columns = [col.strip() for col in args.key_columns.split(",") if col.strip()]
+        if not key_columns:
+            raise UnsafeSqlError("--key-columns must name at least one column.")
+        set_columns = parse_update_set_columns(args.repair)
+        if not set_columns:
+            raise UnsafeSqlError("Could not parse the SET clause to build a repair package.")
+
+    count_sql, snapshot_sql = derive_impact_sql(args, env, from_expr, where_expr, max_rows)
+    change_sql = args.repair.strip().rstrip(";")
+
+    source, sq_config, setup = prepare_source(args, config, env, env_name)
+    try:
+        count_cmd = build_sql_command(args, config, env, count_sql, source, sq_config, fmt="json")
+        snapshot_cmd = build_sql_command(args, config, env, snapshot_sql, source, sq_config, fmt="json")
+
+        if args.print_command:
+            print_setup_prefix(setup, env)
+            print(shlex.join(count_cmd))
+            print(shlex.join(snapshot_cmd))
+            print(shlex.join(build_sql_command(args, config, env, change_sql, source, sq_config)))
+            return 0
+
+        secrets = env_secrets(env)
+        start = datetime.now()
+        exit_code = None
+        affected = None
+        executed = False
+        try:
+            rc, affected, rows, err = run_impact(count_cmd, snapshot_cmd, secrets, args.timeout)
+            if rc != 0:
+                sys.stderr.write(err or "")
+                exit_code = rc
+                return rc
+            if affected is None:
+                raise UnsafeSqlError(
+                    "Could not determine the affected-row count; refusing to build a repair "
+                    "package without a completeness check."
+                )
+            if affected > len(rows):
+                raise UnsafeSqlError(
+                    f"Refusing to build a repair package: {affected} rows match but only "
+                    f"{len(rows)} were captured (max_rows cap). Narrow the WHERE clause or raise max_rows."
+                )
+
+            if token == "update":
+                rollback_sql = build_update_rollback(table, set_columns, key_columns, rows)
+                if rows:
+                    post_check_sql = f"SELECT * FROM {table} WHERE {build_key_disjunction(key_columns, rows)}"
+                else:
+                    post_check_sql = f"SELECT COUNT(*) AS remaining FROM {table} WHERE {where_expr}"
+            else:
+                rollback_sql = build_delete_rollback(table, rows)
+                post_check_sql = f"SELECT COUNT(*) AS remaining FROM {table} WHERE {where_expr}"
+            validate_sql(post_check_sql, allow_write=False)
+
+            package = {
+                "repair": True,
+                "executed": False,
+                "env": None if env_name == "adhoc" else env_name,
+                "token": token,
+                "table": table,
+                "where": where_expr,
+                "affected_rows": affected,
+                "key_columns": key_columns,
+                "set_columns": set_columns,
+                "pre_check": {"snapshot_sql": snapshot_sql, "snapshot": rows},
+                "change_sql": change_sql,
+                "rollback_sql": rollback_sql,
+                "post_check_sql": post_check_sql,
+            }
+
+            if not args.allow_write:
+                package["note"] = (
+                    "database-cli did not execute this change. Review it, run the pre-check, "
+                    "change, and post-check yourself, and keep rollback_sql ready. Re-run with "
+                    "--allow-write only after explicit user approval."
+                )
+                print(json.dumps(package, ensure_ascii=False))
+                exit_code = 0
+                return 0
+
+            change_cmd = build_sql_command(args, config, env, change_sql, source, sq_config)
+            change_rc, change_out, change_err = run_capture(change_cmd, args.timeout, secrets)
+            executed = True
+            package["executed"] = True
+            package["change_result"] = {
+                "exit_code": change_rc,
+                "output": (change_out or change_err).strip(),
+            }
+            if change_rc != 0:
+                package["note"] = "Change failed; post-check skipped. Review change_result and keep rollback_sql ready."
+                print(json.dumps(package, ensure_ascii=False))
+                exit_code = change_rc
+                return change_rc
+
+            post_cmd = build_sql_command(args, config, env, post_check_sql, source, sq_config, fmt="json")
+            post_rc, post_out, post_err = run_capture(post_cmd, args.timeout, secrets)
+            try:
+                post_rows = json.loads(post_out) if post_rc == 0 else None
+            except json.JSONDecodeError:
+                post_rows = None
+            package["post_check"] = {"sql": post_check_sql, "exit_code": post_rc, "rows": post_rows}
+            print(json.dumps(package, ensure_ascii=False))
+            exit_code = 0
+            return 0
+        finally:
+            emit_audit(
+                args, config, env, env_name,
+                event="repair",
+                mode="write" if executed else "read",
+                statement=args.repair,
+                token=token,
+                allow_write=args.allow_write,
+                exit_code=exit_code,
+                duration_ms=round((datetime.now() - start).total_seconds() * 1000, 1),
+                extra={"affected_rows": affected, "executed": executed},
             )
     finally:
         if isinstance(setup, tempfile.TemporaryDirectory):
@@ -1642,6 +1796,9 @@ def main():
 
         if args.generate_rollback:
             return generate_rollback(args, config, env, env_name, max_rows)
+
+        if args.repair:
+            return repair(args, config, env, env_name, max_rows)
 
         audit_event = None
         audit_statement = None
@@ -1707,6 +1864,7 @@ def main():
             emit_audit(
                 args, config, env, env_name,
                 event=audit_event,
+                mode="write" if audit_event == "sql" and audit_token in DML_FIRST_TOKENS else "read",
                 statement=audit_statement,
                 token=audit_token,
                 allow_write=args.allow_write,
