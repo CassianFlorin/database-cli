@@ -214,6 +214,57 @@ def validate_sql(sql, allow_write=False):
     return statement, token
 
 
+def keyword_span_depth0(cleaned, keyword, search_from=0):
+    """Find the first `keyword` at parenthesis depth 0 at/after search_from.
+
+    Operates on comment/literal-stripped, position-preserving text so parens
+    inside string literals or subqueries are handled correctly.
+    """
+    pattern = re.compile(r"\b" + keyword + r"\b", re.I)
+    for match in pattern.finditer(cleaned, search_from):
+        prefix = cleaned[:match.start()]
+        if prefix.count("(") == prefix.count(")"):
+            return match.span()
+    return None
+
+
+def parse_write_target(sql, token):
+    """Extract (from_expr, where_expr) from an UPDATE/DELETE statement.
+
+    Returns None when the statement has no top-level WHERE, or when the shape
+    is not a supported single-statement UPDATE/DELETE (e.g. INSERT/REPLACE).
+    Table names, JOINs, and WHERE conditions are sliced from the original SQL,
+    so backtick/quoted identifiers are preserved verbatim.
+    """
+    if token not in {"update", "delete"}:
+        return None
+    cleaned = strip_comments_and_literals(sql)
+
+    where = keyword_span_depth0(cleaned, "where")
+    if not where:
+        return None
+    where_start, _ = where
+    where_expr = sql[where[1]:].strip().rstrip(";").strip()
+    if not where_expr:
+        return None
+
+    if token == "delete":
+        from_span = keyword_span_depth0(cleaned, "from")
+        if not from_span or from_span[1] > where_start:
+            return None
+        from_expr = sql[from_span[1]:where_start].strip()
+    else:  # update
+        set_span = keyword_span_depth0(cleaned, "set")
+        update_span = keyword_span_depth0(cleaned, "update")
+        if not set_span or not update_span or set_span[1] > where_start:
+            return None
+        from_expr = sql[update_span[1]:set_span[0]].strip()
+
+    if not from_expr:
+        return None
+    return from_expr, where_expr
+
+
 def maybe_add_limit(sql, token, limit, limit_style, no_auto_limit):
     return maybe_add_limit_with_cap(sql, token, limit, limit_style, no_auto_limit, None)
 
@@ -1002,6 +1053,28 @@ def write_audit(path, entry):
         print(f"db-query: audit log write failed: {exc}", file=sys.stderr)
 
 
+def emit_audit(args, config, env, env_name, *, event, statement, token, allow_write, exit_code, duration_ms, extra=None):
+    if not audit_enabled(args, config, env):
+        return
+    entry = {
+        "ts": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "event": event,
+        "env": None if env_name == "adhoc" else env_name,
+        "adhoc": env_name == "adhoc",
+        "mode": "write" if token in DML_FIRST_TOKENS and event != "preview_write" else "read",
+        "token": token,
+        "statement": redact(statement, env_secrets(env)) if statement else statement,
+        "allow_write": bool(allow_write),
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "user": audit_user(),
+        "pid": os.getpid(),
+    }
+    if extra:
+        entry.update(extra)
+    write_audit(resolve_audit_path(args, config, env), entry)
+
+
 def source_handle_for(env_name):
     suffix = re.sub(r"[^A-Za-z0-9_]+", "_", env_name).strip("_") or "default"
     return f"@database_cli_{suffix}"
@@ -1030,7 +1103,7 @@ def base_sq_command(args, config, env, require_executable=True, sq_config_overri
     return cmd
 
 
-def build_sql_command(args, config, env, sql, source, sq_config_override=None):
+def build_sql_command(args, config, env, sql, source, sq_config_override=None, fmt=None):
     cmd = base_sq_command(
         args,
         config,
@@ -1043,7 +1116,7 @@ def build_sql_command(args, config, env, sql, source, sq_config_override=None):
     schema = args.schema or env.get("schema")
     if schema:
         cmd.extend(["--src.schema", schema])
-    cmd.extend(output_flags(args.format))
+    cmd.extend(output_flags(fmt or args.format))
     cmd.append(sql)
     return cmd
 
@@ -1080,6 +1153,12 @@ def run_command(cmd, timeout, secrets=None):
     if proc.stderr:
         sys.stderr.write(redact(proc.stderr, secrets))
     return proc.returncode
+
+
+def run_capture(cmd, timeout, secrets=None):
+    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    secrets = secrets or []
+    return proc.returncode, redact(proc.stdout, secrets), redact(proc.stderr, secrets)
 
 
 def run_internal_command(cmd, timeout, secrets, input_text=None):
@@ -1176,6 +1255,7 @@ def parse_args():
     parser.add_argument("--schema", help="Override schema/catalog for this call.")
     parser.add_argument("--sql", help="Read-only SQL statement to execute.")
     parser.add_argument("--check-sql", help="Validate SQL safety without executing.")
+    parser.add_argument("--preview-write", help="Preview an UPDATE/DELETE's impact without executing it: reports affected-row count and a bounded before-snapshot of the matched rows.")
     parser.add_argument("--inspect", nargs="?", const="", help="Inspect a source or table.")
     parser.add_argument("--search-objects", help="Search schema/table/column/index/procedure metadata with a SQL LIKE pattern.")
     parser.add_argument("--object-type", choices=["schema", "table", "column", "index", "procedure", "function"], default="table")
@@ -1194,6 +1274,117 @@ def parse_args():
     parser.add_argument("--sq-bin", default="sq", help="sq executable path or name.")
     parser.add_argument("--timeout", type=int, default=60, help="Command timeout in seconds.")
     return parser.parse_args()
+
+
+def parse_count_result(stdout):
+    try:
+        rows = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return None
+    row = rows[0]
+    if "affected_rows" in row:
+        value = row["affected_rows"]
+    else:
+        value = next(iter(row.values()), None)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def preview_write(args, config, env, env_name, max_rows):
+    statement, token = validate_sql(args.preview_write, allow_write=True)
+    if token not in {"update", "delete"}:
+        raise UnsafeSqlError("--preview-write supports UPDATE and DELETE statements only.")
+    target = parse_write_target(args.preview_write, token)
+    if not target:
+        raise UnsafeSqlError(
+            "Could not extract a top-level WHERE target from the statement. "
+            "Preview supports single-statement UPDATE/DELETE with a WHERE clause."
+        )
+    from_expr, where_expr = target
+    count_sql = f"SELECT COUNT(*) AS affected_rows FROM {from_expr} WHERE {where_expr}"
+    snapshot_sql = f"SELECT * FROM {from_expr} WHERE {where_expr}"
+    # The reconstructed statements must themselves pass read-only validation.
+    validate_sql(count_sql, allow_write=False)
+    validate_sql(snapshot_sql, allow_write=False)
+    limit_style = env.get("limit_style", "limit")
+    snapshot_sql = maybe_add_limit_with_cap(
+        snapshot_sql, "select", args.limit, limit_style, args.no_auto_limit, max_rows
+    )
+
+    source, sq_config, setup = prepare_source(args, config, env, env_name)
+    try:
+        count_cmd = build_sql_command(args, config, env, count_sql, source, sq_config, fmt="json")
+        snapshot_cmd = build_sql_command(args, config, env, snapshot_sql, source, sq_config, fmt="json")
+
+        if args.print_command:
+            if isinstance(setup, tuple):
+                prefix, setup_cmd = setup
+                print(prefix + redact(shlex.join(setup_cmd), env_secrets(env)))
+                print("&&")
+            elif isinstance(setup, list):
+                print(redact(shlex.join(setup), env_secrets(env)))
+                print("&&")
+            print(shlex.join(count_cmd))
+            print(shlex.join(snapshot_cmd))
+            return 0
+
+        secrets = env_secrets(env)
+        start = datetime.now()
+        exit_code = None
+        affected = None
+        try:
+            count_rc, count_out, count_err = run_capture(count_cmd, args.timeout, secrets)
+            if count_rc != 0:
+                sys.stderr.write(count_err or count_out)
+                exit_code = count_rc
+                return count_rc
+            affected = parse_count_result(count_out)
+
+            snap_rc, snap_out, snap_err = run_capture(snapshot_cmd, args.timeout, secrets)
+            if snap_rc != 0:
+                sys.stderr.write(snap_err or snap_out)
+                exit_code = snap_rc
+                return snap_rc
+
+            try:
+                snapshot_rows = json.loads(snap_out)
+            except json.JSONDecodeError:
+                snapshot_rows = []
+            truncated = bool(max_rows and affected is not None and affected > len(snapshot_rows))
+
+            envelope = {
+                "preview": True,
+                "token": token,
+                "from": from_expr,
+                "where": where_expr,
+                "affected_rows": affected,
+                "snapshot_rows": len(snapshot_rows),
+                "snapshot_truncated": truncated,
+                "count_sql": count_sql,
+                "snapshot_sql": snapshot_sql,
+                "snapshot": snapshot_rows,
+            }
+            print(json.dumps(envelope, ensure_ascii=False))
+            exit_code = 0
+            return 0
+        finally:
+            emit_audit(
+                args, config, env, env_name,
+                event="preview_write",
+                statement=args.preview_write,
+                token=token,
+                allow_write=False,
+                exit_code=exit_code,
+                duration_ms=round((datetime.now() - start).total_seconds() * 1000, 1),
+                extra={"affected_rows": affected},
+            )
+    finally:
+        if isinstance(setup, tempfile.TemporaryDirectory):
+            setup.cleanup()
 
 
 def main():
@@ -1223,6 +1414,9 @@ def main():
         config, path, env_name, env = runtime_connection(args)
         enforce_readonly(config, env, env_name)
         max_rows = configured_max_rows(config, env)
+
+        if args.preview_write:
+            return preview_write(args, config, env, env_name, max_rows)
 
         audit_event = None
         audit_statement = None
@@ -1285,22 +1479,15 @@ def main():
             exit_code = run_command(cmd, args.timeout, secrets)
             return exit_code
         finally:
-            if audit_enabled(args, config, env):
-                entry = {
-                    "ts": start.astimezone().isoformat(timespec="milliseconds"),
-                    "event": audit_event,
-                    "env": None if env_name == "adhoc" else env_name,
-                    "adhoc": env_name == "adhoc",
-                    "mode": "write" if audit_token in DML_FIRST_TOKENS else "read",
-                    "token": audit_token,
-                    "statement": redact(audit_statement, secrets) if audit_statement else audit_statement,
-                    "allow_write": bool(args.allow_write),
-                    "exit_code": exit_code,
-                    "duration_ms": round((datetime.now() - start).total_seconds() * 1000, 1),
-                    "user": audit_user(),
-                    "pid": os.getpid(),
-                }
-                write_audit(resolve_audit_path(args, config, env), entry)
+            emit_audit(
+                args, config, env, env_name,
+                event=audit_event,
+                statement=audit_statement,
+                token=audit_token,
+                allow_write=args.allow_write,
+                exit_code=exit_code,
+                duration_ms=round((datetime.now() - start).total_seconds() * 1000, 1),
+            )
             if isinstance(setup, tempfile.TemporaryDirectory):
                 setup.cleanup()
     except (ConfigError, UnsafeSqlError, subprocess.TimeoutExpired) as exc:

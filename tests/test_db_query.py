@@ -553,5 +553,138 @@ class AuditLogTest(unittest.TestCase):
             self.assertFalse(audit.exists())
 
 
+class PreviewWriteTest(unittest.TestCase):
+    def write_config(self, tmpdir, env):
+        config = Path(tmpdir) / "connections.local.json"
+        config.write_text(json.dumps({"environments": {"qa01": env}}), encoding="utf-8")
+        return config
+
+    def derived_sqls(self, tmpdir, dml, env=None):
+        """Return (count_sql, snapshot_sql) via --print-command (no sq needed)."""
+        env = env or {"source": "@qa01", "driver": "mysql"}
+        config = self.write_config(tmpdir, env)
+        result = subprocess.run(
+            [
+                str(DB_QUERY),
+                "--config", str(config),
+                "--env", "qa01",
+                "--no-audit",
+                "--print-command",
+                "--preview-write", dml,
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        sq_lines = [line for line in result.stdout.splitlines() if line.startswith("sq ")]
+        self.assertEqual(len(sq_lines), 2, result.stdout)
+        return shlex.split(sq_lines[0])[-1], shlex.split(sq_lines[1])[-1]
+
+    def test_update_derives_count_and_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            count_sql, snapshot_sql = self.derived_sqls(
+                tmpdir, "UPDATE cc_order SET status = 1 WHERE order_no = 'YP1'"
+            )
+            self.assertEqual(
+                count_sql,
+                "SELECT COUNT(*) AS affected_rows FROM cc_order WHERE order_no = 'YP1'",
+            )
+            self.assertEqual(
+                snapshot_sql,
+                "SELECT * FROM cc_order WHERE order_no = 'YP1' LIMIT 200",
+            )
+
+    def test_delete_derives_count_and_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            count_sql, snapshot_sql = self.derived_sqls(
+                tmpdir, "DELETE FROM cc_order WHERE id = 3"
+            )
+            self.assertEqual(count_sql, "SELECT COUNT(*) AS affected_rows FROM cc_order WHERE id = 3")
+            self.assertEqual(snapshot_sql, "SELECT * FROM cc_order WHERE id = 3 LIMIT 200")
+
+    def test_subquery_where_does_not_confuse_top_level_where(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            count_sql, snapshot_sql = self.derived_sqls(
+                tmpdir,
+                "UPDATE cc_order SET status = 9 WHERE id IN (SELECT id FROM cc_ref WHERE flag = 1)",
+            )
+            self.assertEqual(
+                count_sql,
+                "SELECT COUNT(*) AS affected_rows FROM cc_order "
+                "WHERE id IN (SELECT id FROM cc_ref WHERE flag = 1)",
+            )
+            self.assertTrue(snapshot_sql.endswith("WHERE id IN (SELECT id FROM cc_ref WHERE flag = 1) LIMIT 200"))
+
+    def test_where_containing_literal_where_keyword_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            count_sql, _ = self.derived_sqls(
+                tmpdir, "UPDATE t SET a = 1 WHERE note = 'set where from'"
+            )
+            self.assertEqual(
+                count_sql,
+                "SELECT COUNT(*) AS affected_rows FROM t WHERE note = 'set where from'",
+            )
+
+    def test_insert_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(tmpdir, {"source": "@qa01", "driver": "mysql"})
+            result = subprocess.run(
+                [
+                    str(DB_QUERY), "--config", str(config), "--env", "qa01",
+                    "--no-audit", "--print-command",
+                    "--preview-write", "INSERT INTO t (a) VALUES (1)",
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("UPDATE and DELETE", result.stderr)
+
+    def test_update_without_where_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(tmpdir, {"source": "@qa01", "driver": "mysql"})
+            result = subprocess.run(
+                [
+                    str(DB_QUERY), "--config", str(config), "--env", "qa01",
+                    "--no-audit", "--print-command",
+                    "--preview-write", "UPDATE t SET a = 1",
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("WHERE", result.stderr)
+
+    def make_fake_sq(self, tmpdir):
+        fake = Path(tmpdir) / "fake-sq"
+        fake.write_text("#!/usr/bin/env python3\nprint('[]')\n", encoding="utf-8")
+        fake.chmod(0o755)
+        return fake
+
+    def test_preview_emits_envelope_and_audits_as_read(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.write_config(tmpdir, {"source": "@qa01", "driver": "mysql"})
+            fake = self.make_fake_sq(tmpdir)
+            audit = Path(tmpdir) / "audit.log"
+            result = subprocess.run(
+                [
+                    str(DB_QUERY), "--config", str(config), "--env", "qa01",
+                    "--sq-bin", str(fake), "--audit-log", str(audit),
+                    "--preview-write", "DELETE FROM cc_order WHERE id = 5",
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            envelope = json.loads(result.stdout)
+            self.assertTrue(envelope["preview"])
+            self.assertEqual(envelope["token"], "delete")
+            self.assertEqual(envelope["from"], "cc_order")
+            self.assertEqual(envelope["where"], "id = 5")
+            self.assertIn("snapshot", envelope)
+
+            entry = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(entry["event"], "preview_write")
+            self.assertEqual(entry["mode"], "read")
+            self.assertFalse(entry["allow_write"])
+
+
 if __name__ == "__main__":
     unittest.main()

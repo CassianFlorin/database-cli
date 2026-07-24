@@ -175,6 +175,25 @@ def tool_schema(config_path=None):
             },
         },
         {
+            "name": "preview_write",
+            "description": "Preview an UPDATE/DELETE's impact without executing it. Returns affected-row count and a bounded before-snapshot of matched rows; needs no allow_write.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": common_config,
+                    "env": env,
+                    **connection_properties,
+                    "sql": {"type": "string", "description": "Single-statement UPDATE/DELETE with a WHERE clause."},
+                    "schema": {"type": "string", "description": "Optional schema/catalog override."},
+                    "limit": {"type": "integer", "minimum": 0},
+                    "no_auto_limit": {"type": "boolean"},
+                    "print_command": {"type": "boolean"},
+                },
+                "required": ["sql"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "inspect",
             "description": "Inspect a database source or one table through database-cli.",
             "inputSchema": {
@@ -441,6 +460,15 @@ def command_for_tool(name, args):
         if args.get("env"):
             cmd.extend(["--env", args["env"]])
         cmd.extend(["--sql", args["sql"]])
+        return cmd
+    if name == "preview_write":
+        add_common_args(cmd, args)
+        add_connection_args(cmd, args)
+        if args.get("print_command"):
+            cmd.append("--print-command")
+        if args.get("env"):
+            cmd.extend(["--env", args["env"]])
+        cmd.extend(["--preview-write", args["sql"]])
         return cmd
     if name == "inspect":
         add_common_args(cmd, args)

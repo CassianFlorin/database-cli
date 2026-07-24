@@ -240,6 +240,35 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("UPDATE cc_order SET status = 1 WHERE id = 10", stdout)
         self.assertNotIn("local-secret", stdout)
 
+    def test_preview_write_derives_readonly_selects(self):
+        responses = self.call_server(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "preview_write",
+                        "arguments": {
+                            "url": "mysql://mysql-adhoc.example.internal:3306/qnvip_center_order",
+                            "username": "readonly_user",
+                            "password": "local-secret",
+                            "sql": "DELETE FROM cc_order WHERE id = 10",
+                            "print_command": True,
+                        },
+                    },
+                }
+            ]
+        )
+
+        result = responses[0]["result"]
+        self.assertEqual(result["structuredContent"]["exit_code"], 0)
+        stdout = result["structuredContent"]["stdout"]
+        self.assertIn("SELECT COUNT(*) AS affected_rows FROM cc_order WHERE id = 10", stdout)
+        self.assertIn("SELECT * FROM cc_order WHERE id = 10", stdout)
+        self.assertNotIn("DELETE", stdout)
+        self.assertNotIn("local-secret", stdout)
+
     def test_lists_configured_custom_tool(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self.write_config(

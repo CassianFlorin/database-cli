@@ -91,6 +91,7 @@ scripts/db-query --check-sql "SELECT id FROM cc_order WHERE order_no = 'YP...'"
 - Configured MCP custom tools are allowed only for parameterized read-only SQL templates. Do not put repair SQL in a custom tool.
 - If data must be repaired and the user has not explicitly allowed Agent execution, output SQL for a human to execute. Include target environment, pre-check SQL, change SQL, post-check SQL, and rollback or recovery notes.
 - If the user explicitly allows Agent execution, run the pre-check first, execute exactly one DML statement with `--allow-write`, then run the post-check and report the affected evidence.
+- Before proposing or executing any `UPDATE`/`DELETE`, run `--preview-write` first and confirm the affected-row count matches the intended scope. Treat an unexpected count as a stop condition, not a detail.
 
 ## Setup Check
 
@@ -213,6 +214,16 @@ scripts/db-query --env qa01 --allow-write --sql "UPDATE dbname.table_name SET st
 
 Run a pre-check before this command and a post-check after it.
 
+## Preview Write Impact
+
+Before proposing or running any `UPDATE`/`DELETE`, preview its blast radius. `--preview-write` never executes the statement; it derives a read-only `SELECT COUNT(*)` plus a bounded before-snapshot from the statement's own `FROM`/`WHERE`, so it needs no `--allow-write`:
+
+```bash
+scripts/db-query --env qa01 --preview-write "UPDATE cc_order SET status = 1 WHERE order_no = 'YP...'"
+```
+
+It prints one JSON object: `affected_rows` (exact count), `snapshot` (the matched rows before any change, capped by `max_rows`), `snapshot_truncated`, and the derived `count_sql`/`snapshot_sql`. The `WHERE` target is extracted at top-level parenthesis depth, so a subquery's inner `WHERE` never becomes the boundary. Use this as the pre-check evidence in a repair package, and to confirm the affected-row count matches the user's intent before asking for write approval. Only single-statement `UPDATE`/`DELETE` with a `WHERE` clause are supported; `INSERT`/`REPLACE` have no before-image and are rejected.
+
 ## Optional MCP Adapter
 
 When a client needs MCP tools, point it at:
@@ -221,7 +232,7 @@ When a client needs MCP tools, point it at:
 scripts/database-mcp
 ```
 
-The adapter exposes `setup_status`, `add_connection`, `list_envs`, `query_readonly`, `execute_sql`, `inspect`, `search_objects`, and `check_sql`. `setup_status` returns readiness, missing prerequisites, configured environments, and next actions without querying a database. `execute_sql` defaults to read-only and accepts ad-hoc connection fields; pass `allow_write=true` only after explicit user approval for DML. `add_connection` writes config through the same initializer path and lets a running Agent add or update a connection without restart; subsequent tool calls read the updated config. `search_objects` supports schema, table, column, index, procedure, and function metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it only when Agent-native structured calls are useful; CLI remains the source of truth.
+The adapter exposes `setup_status`, `add_connection`, `list_envs`, `query_readonly`, `execute_sql`, `preview_write`, `inspect`, `search_objects`, and `check_sql`. `preview_write` reports an UPDATE/DELETE's affected-row count and a bounded before-snapshot without executing it, and needs no `allow_write`. `setup_status` returns readiness, missing prerequisites, configured environments, and next actions without querying a database. `execute_sql` defaults to read-only and accepts ad-hoc connection fields; pass `allow_write=true` only after explicit user approval for DML. `add_connection` writes config through the same initializer path and lets a running Agent add or update a connection without restart; subsequent tool calls read the updated config. `search_objects` supports schema, table, column, index, procedure, and function metadata. Each `tools/call` keeps text `content` and also returns `structuredContent` with `exit_code`, `stdout`, `stderr`, and a `json` field when stdout is valid JSON. Use it only when Agent-native structured calls are useful; CLI remains the source of truth.
 
 If `connections.local.json` has a top-level `tools` object, `scripts/database-mcp` also exposes those parameterized read-only custom tools. Parameters are rendered as SQL literals and then passed through `scripts/db-query`, so the same read-only validator and `max_rows` cap still apply.
 
@@ -249,6 +260,12 @@ Use a one-off connection without writing config:
 
 ```bash
 scripts/db-query --url "mysql://host/dbname" --username readonly_user --password-env DB_PASSWORD --sql "SELECT 1"
+```
+
+Preview an UPDATE/DELETE's impact without executing it:
+
+```bash
+scripts/db-query --env qa01 --preview-write "UPDATE table_name SET status = 1 WHERE id = 10"
 ```
 
 Execute approved DML:
