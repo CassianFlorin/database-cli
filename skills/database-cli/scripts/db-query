@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import getpass
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse
 
@@ -19,6 +21,7 @@ DEFAULT_CONFIG_PATHS = [
     Path.cwd() / "connections.local.json",
     Path.home() / ".config" / "database-cli" / "connections.json",
 ]
+DEFAULT_AUDIT_PATH = Path.home() / ".local" / "state" / "database-cli" / "audit.log"
 
 ALLOWED_FIRST_TOKENS = {"select", "show", "desc", "describe", "explain", "with"}
 DML_FIRST_TOKENS = {"insert", "update", "delete", "replace"}
@@ -961,6 +964,44 @@ def env_secrets(env):
     return [password_value(env)]
 
 
+def audit_enabled(args, config, env):
+    if getattr(args, "no_audit", False):
+        return False
+    for scope in (env, config):
+        if isinstance(scope, dict) and "audit" in scope:
+            return bool_value(scope.get("audit"), True)
+    return True
+
+
+def resolve_audit_path(args, config, env):
+    explicit = getattr(args, "audit_log", None)
+    if explicit:
+        return Path(explicit).expanduser()
+    env_path = os.environ.get("DATABASE_CLI_AUDIT_LOG")
+    if env_path:
+        return Path(env_path).expanduser()
+    for scope in (env, config):
+        if isinstance(scope, dict) and scope.get("audit_log"):
+            return Path(str(scope["audit_log"])).expanduser()
+    return DEFAULT_AUDIT_PATH
+
+
+def audit_user():
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+
+
+def write_audit(path, entry):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(f"db-query: audit log write failed: {exc}", file=sys.stderr)
+
+
 def source_handle_for(env_name):
     suffix = re.sub(r"[^A-Za-z0-9_]+", "_", env_name).strip("_") or "default"
     return f"@database_cli_{suffix}"
@@ -1148,6 +1189,8 @@ def parse_args():
     parser.add_argument("--no-auto-limit", action="store_true", help="Do not append LIMIT to SELECT/WITH queries.")
     parser.add_argument("--allow-write", action="store_true", help="Allow DML SQL after explicit user approval. DDL, transactions, procedures, locks, exports, and other side effects remain blocked.")
     parser.add_argument("--print-command", action="store_true", help="Print the sq command instead of executing it.")
+    parser.add_argument("--audit-log", help="Path to the append-only audit log. Overrides DATABASE_CLI_AUDIT_LOG and config 'audit_log'.")
+    parser.add_argument("--no-audit", action="store_true", help="Disable audit logging for this call.")
     parser.add_argument("--sq-bin", default="sq", help="sq executable path or name.")
     parser.add_argument("--timeout", type=int, default=60, help="Command timeout in seconds.")
     return parser.parse_args()
@@ -1181,6 +1224,10 @@ def main():
         enforce_readonly(config, env, env_name)
         max_rows = configured_max_rows(config, env)
 
+        audit_event = None
+        audit_statement = None
+        audit_token = None
+
         if args.sql:
             _, token = validate_sql(args.sql, allow_write=args.allow_write)
             sql = maybe_add_limit_with_cap(
@@ -1193,6 +1240,9 @@ def main():
             )
             source, sq_config, setup = prepare_source(args, config, env, env_name)
             cmd = build_sql_command(args, config, env, sql, source, sq_config)
+            audit_event = "sql"
+            audit_statement = sql
+            audit_token = token
         elif args.search_objects:
             search_sql = build_search_objects_sql(env, args)
             _, token = validate_sql(search_sql, allow_write=False)
@@ -1206,9 +1256,14 @@ def main():
             )
             source, sq_config, setup = prepare_source(args, config, env, env_name)
             cmd = build_sql_command(args, config, env, sql, source, sq_config)
+            audit_event = "search_objects"
+            audit_statement = sql
+            audit_token = token
         elif args.inspect is not None:
             source, sq_config, setup = prepare_source(args, config, env, env_name)
             cmd = build_inspect_command(args, config, env, source, sq_config)
+            audit_event = "inspect"
+            audit_statement = args.inspect or ""
         else:
             raise ConfigError("Provide --sql, --search-objects, --inspect, --list-envs, or --check-sql.")
 
@@ -1223,9 +1278,29 @@ def main():
             print(shlex.join(cmd))
             return 0
 
+        secrets = env_secrets(env)
+        start = datetime.now()
+        exit_code = None
         try:
-            return run_command(cmd, args.timeout, env_secrets(env))
+            exit_code = run_command(cmd, args.timeout, secrets)
+            return exit_code
         finally:
+            if audit_enabled(args, config, env):
+                entry = {
+                    "ts": start.astimezone().isoformat(timespec="milliseconds"),
+                    "event": audit_event,
+                    "env": None if env_name == "adhoc" else env_name,
+                    "adhoc": env_name == "adhoc",
+                    "mode": "write" if audit_token in DML_FIRST_TOKENS else "read",
+                    "token": audit_token,
+                    "statement": redact(audit_statement, secrets) if audit_statement else audit_statement,
+                    "allow_write": bool(args.allow_write),
+                    "exit_code": exit_code,
+                    "duration_ms": round((datetime.now() - start).total_seconds() * 1000, 1),
+                    "user": audit_user(),
+                    "pid": os.getpid(),
+                }
+                write_audit(resolve_audit_path(args, config, env), entry)
             if isinstance(setup, tempfile.TemporaryDirectory):
                 setup.cleanup()
     except (ConfigError, UnsafeSqlError, subprocess.TimeoutExpired) as exc:

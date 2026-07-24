@@ -281,6 +281,31 @@ Create or update local config non-interactively through the install entrypoint:
 scripts/install --env qa01 --url "mysql://mysql-qa01.example.internal" --username readonly_user --password-env QA01_DB_PASSWORD --non-interactive
 ```
 
+## Audit Log
+
+Every call that actually reaches a database — `--sql`, `--search-objects`, and `--inspect` — appends one JSON line to a local append-only audit log. Calls that never touch a database (`--setup-status`, `--check-sql`, `--list-envs`, `--print-command`) are not logged. The MCP adapter delegates to `scripts/db-query`, so its executions are audited through the same path.
+
+Each entry records: `ts` (local ISO 8601), `event` (`sql`/`search_objects`/`inspect`), `env` (connection name, or `null` for ad-hoc), `adhoc`, `mode` (`read`/`write`), `token`, `statement` (the executed SQL with the auto-appended limit, secrets redacted), `allow_write`, `exit_code`, `duration_ms`, `user`, and `pid`.
+
+Default location is `~/.local/state/database-cli/audit.log`. Resolution order:
+
+1. `--audit-log <path>`
+2. `DATABASE_CLI_AUDIT_LOG` environment variable
+3. config `audit_log` (top-level or per-environment)
+4. the default path above
+
+Disable logging for a single call with `--no-audit`, or persistently with `"audit": false` in config (top-level or per-environment). Audit failures never block a query; a write error is reported to stderr and the query result is still returned. Inspect the trail with standard tools:
+
+```bash
+tail -n 20 ~/.local/state/database-cli/audit.log
+```
+
+Filter to write operations only:
+
+```bash
+grep '"mode": "write"' ~/.local/state/database-cli/audit.log
+```
+
 ## Notes
 
 - Direct config is preferred: the wrapper can build a temporary `sq` source from `driver`, `host`, `port`, `username`, and `password`. `database` and `schema` are optional defaults, not access limits.

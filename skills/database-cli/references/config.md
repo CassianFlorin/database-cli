@@ -116,6 +116,8 @@ Fields:
 - `limit_style`: Optional. Use `limit` for MySQL/Postgres/SQLite/DuckDB. Use `none` if the database does not accept appended `LIMIT`.
 - `max_rows`: Optional positive integer at top level or per environment. It is a hard cap for auto-appended limits and larger existing `LIMIT` clauses.
 - `readonly`: Optional boolean. Only `true` or omitted is supported. `false` is rejected because this skill never executes write SQL.
+- `audit`: Optional boolean at top level or per environment. Defaults to `true`. Set `false` to disable audit logging. A per-environment value overrides the top-level value.
+- `audit_log`: Optional path at top level or per environment. Overrides the default `~/.local/state/database-cli/audit.log`. The `--audit-log` flag and `DATABASE_CLI_AUDIT_LOG` environment variable take precedence over config.
 
 ## Optional MCP Custom Tools
 

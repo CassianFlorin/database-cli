@@ -417,5 +417,141 @@ class DbQueryTest(unittest.TestCase):
             self.assertIn("readonly=false", result.stderr)
 
 
+class AuditLogTest(unittest.TestCase):
+    """Audit logging runs around real execution, so these tests stub `sq`.
+
+    Setting `source` on the env makes prepare_source short-circuit the
+    `sq add` step, leaving the fake binary as the only invoked command.
+    """
+
+    def make_fake_sq(self, tmpdir):
+        fake = Path(tmpdir) / "fake-sq"
+        fake.write_text("#!/usr/bin/env python3\nprint('[]')\n", encoding="utf-8")
+        fake.chmod(0o755)
+        return fake
+
+    def write_config(self, tmpdir, env):
+        config = Path(tmpdir) / "connections.local.json"
+        config.write_text(
+            json.dumps({"environments": {"qa01": env}}),
+            encoding="utf-8",
+        )
+        return config
+
+    def run_db_query(self, tmpdir, sql_args, env=None, extra=None):
+        env = env or {"source": "@qa01", "driver": "mysql"}
+        config = self.write_config(tmpdir, env)
+        fake = self.make_fake_sq(tmpdir)
+        audit = Path(tmpdir) / "audit.log"
+        cmd = [
+            str(DB_QUERY),
+            "--config", str(config),
+            "--env", "qa01",
+            "--sq-bin", str(fake),
+            "--audit-log", str(audit),
+        ]
+        if extra:
+            cmd.extend(extra)
+        cmd.extend(sql_args)
+        result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        return result, audit
+
+    def read_entries(self, audit):
+        return [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def test_read_query_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, audit = self.run_db_query(tmpdir, ["--sql", "SELECT id FROM cc_order WHERE id = 1"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            entries = self.read_entries(audit)
+            self.assertEqual(len(entries), 1)
+            entry = entries[0]
+            self.assertEqual(entry["event"], "sql")
+            self.assertEqual(entry["mode"], "read")
+            self.assertEqual(entry["token"], "select")
+            self.assertEqual(entry["env"], "qa01")
+            self.assertFalse(entry["adhoc"])
+            self.assertFalse(entry["allow_write"])
+            self.assertEqual(entry["exit_code"], 0)
+            self.assertIn("SELECT id FROM cc_order", entry["statement"])
+            self.assertIn("ts", entry)
+            self.assertIsInstance(entry["duration_ms"], (int, float))
+
+    def test_write_query_is_recorded_as_write(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, audit = self.run_db_query(
+                tmpdir,
+                ["--sql", "UPDATE cc_order SET status = 1 WHERE id = 1"],
+                extra=["--allow-write"],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            entry = self.read_entries(audit)[0]
+            self.assertEqual(entry["mode"], "write")
+            self.assertEqual(entry["token"], "update")
+            self.assertTrue(entry["allow_write"])
+
+    def test_secret_is_redacted_from_statement(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {"source": "@qa01", "driver": "mysql", "password": "topsecret"}
+            result, audit = self.run_db_query(
+                tmpdir,
+                ["--sql", "SELECT 'topsecret' AS token"],
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            entry = self.read_entries(audit)[0]
+            self.assertNotIn("topsecret", entry["statement"])
+            self.assertIn("***", entry["statement"])
+
+    def test_ad_hoc_connection_marks_env_null(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake = self.make_fake_sq(tmpdir)
+            audit = Path(tmpdir) / "audit.log"
+            result = subprocess.run(
+                [
+                    str(DB_QUERY),
+                    "--url", "mysql://host/db",
+                    "--username", "readonly_user",
+                    "--sq-bin", str(fake),
+                    "--audit-log", str(audit),
+                    "--sql", "SELECT 1",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            entry = self.read_entries(audit)[0]
+            self.assertIsNone(entry["env"])
+            self.assertTrue(entry["adhoc"])
+
+    def test_no_audit_flag_disables_logging(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, audit = self.run_db_query(
+                tmpdir,
+                ["--sql", "SELECT 1"],
+                extra=["--no-audit"],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(audit.exists())
+
+    def test_audit_disabled_via_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {"source": "@qa01", "driver": "mysql", "audit": False}
+            result, audit = self.run_db_query(tmpdir, ["--sql", "SELECT 1"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(audit.exists())
+
+    def test_print_command_does_not_write_audit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, audit = self.run_db_query(
+                tmpdir,
+                ["--sql", "SELECT 1"],
+                extra=["--print-command"],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(audit.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
