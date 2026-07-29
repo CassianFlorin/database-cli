@@ -1,0 +1,21 @@
+name: Install sq
+description: >-
+  Install a pinned sq release. tests/test_integration.py drives the real sq +
+  SQLite path; without sq those tests skip, so both workflows need this and the
+  version/checksum are kept here rather than duplicated in each one.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SQ_VERSION: 0.54.1
+        SQ_SHA256: 1b5b416a9a9675174bc8e4c136b5463e3101aa9cf5be716a1b846992790f0ce0
+      run: |
+        set -euo pipefail
+        curl -fsSL -o /tmp/sq.tar.gz \
+          "https://github.com/neilotoole/sq/releases/download/v${SQ_VERSION}/sq-${SQ_VERSION}-linux-amd64.tar.gz"
+        echo "${SQ_SHA256}  /tmp/sq.tar.gz" | sha256sum -c -
+        tar -xzf /tmp/sq.tar.gz -C /tmp sq
+        install -m 0755 /tmp/sq /usr/local/bin/sq
+        sq --version

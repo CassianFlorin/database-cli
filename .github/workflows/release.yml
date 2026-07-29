@@ -26,7 +26,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install sq
+        uses: ./.github/actions/install-sq
+
       - name: Run tests
+        # Turns a broken sq install into a failure instead of a silent skip.
+        env:
+          DATABASE_CLI_REQUIRE_SQ: "1"
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
   release:
