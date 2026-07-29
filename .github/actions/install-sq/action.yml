@@ -13,9 +13,14 @@ runs:
         SQ_SHA256: 1b5b416a9a9675174bc8e4c136b5463e3101aa9cf5be716a1b846992790f0ce0
       run: |
         set -euo pipefail
-        curl -fsSL -o /tmp/sq.tar.gz \
+        # 必须解压到独立目录，不能落在 $TMPDIR 根下：sq 启动时会在 $TMPDIR/sq
+        # 建缓存目录，残留的同名二进制会让它以
+        # "sq: mkdir /tmp/sq: not a directory" 失败。
+        work="$(mktemp -d)"
+        trap 'rm -rf "$work"' EXIT
+        curl -fsSL -o "$work/sq.tar.gz" \
           "https://github.com/neilotoole/sq/releases/download/v${SQ_VERSION}/sq-${SQ_VERSION}-linux-amd64.tar.gz"
-        echo "${SQ_SHA256}  /tmp/sq.tar.gz" | sha256sum -c -
-        tar -xzf /tmp/sq.tar.gz -C /tmp sq
-        install -m 0755 /tmp/sq /usr/local/bin/sq
+        echo "${SQ_SHA256}  $work/sq.tar.gz" | sha256sum -c -
+        tar -xzf "$work/sq.tar.gz" -C "$work" sq
+        install -m 0755 "$work/sq" /usr/local/bin/sq
         sq --version
