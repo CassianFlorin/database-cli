@@ -19,10 +19,10 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -41,18 +41,22 @@ jobs:
     runs-on: ubuntu-latest
     # 跳过机器人/合并产生的空提交场景可在此扩展条件
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # 计算版本需要完整历史与已有 tag
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       # dry_run：只算版本、先不打 tag。版本号要先写进文件、提交，tag 才能落在
       # 带有正确版本号的那个提交上；否则 tag 指向的永远是上一个版本的内容。
+      # v6.2（2024-03）仍是该 action 的最新发布，运行时停留在 Node 20，因此
+      # 这里会保留一条 Node 20 弃用告警——不是漏升，是上游没有更新的版本。
+      # 目前仍可用（GitHub 把 Node 20 的 action 强制跑在 Node 24 上）。若哪天
+      # 真正停止支持，需要换用其他 action 或自行实现版本推算。
       - name: Determine next version
         id: tag
         uses: mathieudutour/github-tag-action@v6.2
@@ -99,7 +103,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.tag.outputs.new_tag != ''
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.new_tag }}
           name: ${{ steps.tag.outputs.new_tag }}
