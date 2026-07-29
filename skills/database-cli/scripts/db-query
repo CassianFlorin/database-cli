@@ -2,25 +2,34 @@
 import argparse
 import getpass
 import json
+import math
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse
+from urllib.parse import quote, urlencode
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _common import (  # noqa: E402  (path set above; these scripts are not a package)
+    ConfigError,
+    UnsafeSqlError,
+    alias_values,
+    config_paths,
+    load_config,
+    parse_database_url,
+    sql_literal,
+)
 
 
 DEFAULT_LIMIT = 200
+DEFAULT_MAX_WRITE_ROWS = 1000
 SKILL_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG_PATHS = [
-    SKILL_ROOT / "connections.local.json",
-    Path.cwd() / "connections.local.json",
-    Path.home() / ".config" / "database-cli" / "connections.json",
-]
 DEFAULT_AUDIT_PATH = Path.home() / ".local" / "state" / "database-cli" / "audit.log"
 
 ALLOWED_FIRST_TOKENS = {"select", "show", "desc", "describe", "explain", "with"}
@@ -55,14 +64,6 @@ FORBIDDEN_PATTERNS = [
     re.compile(r"\binto\s+dumpfile\b", re.I),
     re.compile(r"\b(nextval|setval|get_lock|release_lock|sleep|pg_sleep|benchmark|dblink_exec)\s*\(", re.I),
 ]
-
-
-class ConfigError(Exception):
-    pass
-
-
-class UnsafeSqlError(Exception):
-    pass
 
 
 def strip_comments_and_literals(sql):
@@ -203,6 +204,18 @@ def validate_sql(sql, allow_write=False):
     forbidden = FORBIDDEN_KEYWORDS - (DML_FIRST_TOKENS if allow_write else set())
     if allow_write and token == "update":
         forbidden = forbidden - {"set"}
+    if token == "show":
+        # SHOW has no mutating form, and the object it names collides with the
+        # keyword list: SHOW CREATE TABLE, SHOW GRANTS, and SHOW ENGINE ... are
+        # all read-only. The pattern checks below still apply.
+        forbidden = set()
+    elif token == "explain":
+        # EXPLAIN ANALYZE <dml> executes the statement on MySQL 8.0.18+, and an
+        # EXPLAIN slips past every guard that keys off the first token: the
+        # WHERE requirement, the affected-row cap, and the read/write split in
+        # the audit log. So DML keywords stay forbidden here even under
+        # --allow-write. EXPLAIN ANALYZE SELECT is unaffected.
+        forbidden = FORBIDDEN_KEYWORDS
     blocked = sorted(words & forbidden)
     if blocked:
         raise UnsafeSqlError(f"SQL contains blocked keyword(s): {', '.join(blocked)}.")
@@ -322,7 +335,14 @@ def parse_update_set_columns(sql):
     return columns
 
 
-def sql_value_literal(value):
+def sql_value_literal(value, driver):
+    """Render a snapshot value as a literal that restores it exactly.
+
+    Values arrive from `sq --json`, so the possible types are those json.loads
+    produces. A value that cannot be represented faithfully is refused rather
+    than approximated: this SQL exists to undo a change, and a rollback that
+    silently writes something else is worse than no rollback.
+    """
     if value is None:
         return "NULL"
     if isinstance(value, bool):
@@ -330,17 +350,25 @@ def sql_value_literal(value):
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise UnsafeSqlError(
+                f"Snapshot holds {value!r}, which has no SQL literal form; refusing to "
+                "emit a rollback that would not restore the original value."
+            )
         return repr(value)
-    return sql_literal(str(value))
+    if isinstance(value, (dict, list)):
+        # A JSON column round-trips as JSON text, not as a Python repr.
+        return sql_literal(json.dumps(value, ensure_ascii=False, sort_keys=True), driver)
+    return sql_literal(str(value), driver)
 
 
-def key_predicate(column, value):
+def key_predicate(column, value, driver):
     if value is None:
         return f"{column} IS NULL"
-    return f"{column} = {sql_value_literal(value)}"
+    return f"{column} = {sql_value_literal(value, driver)}"
 
 
-def build_update_rollback(table, set_columns, key_columns, rows):
+def build_update_rollback(table, set_columns, key_columns, rows, driver):
     statements = []
     for row in rows:
         set_parts = []
@@ -349,32 +377,32 @@ def build_update_rollback(table, set_columns, key_columns, rows):
                 raise UnsafeSqlError(
                     f"SET column '{col}' is absent from the snapshot; cannot build a rollback."
                 )
-            set_parts.append(f"{col} = {sql_value_literal(row[col])}")
+            set_parts.append(f"{col} = {sql_value_literal(row[col], driver)}")
         where_parts = []
         for key in key_columns:
             if key not in row:
                 raise UnsafeSqlError(
                     f"Key column '{key}' is absent from the snapshot; cannot build a rollback."
                 )
-            where_parts.append(key_predicate(key, row[key]))
+            where_parts.append(key_predicate(key, row[key], driver))
         statements.append(
             f"UPDATE {table} SET {', '.join(set_parts)} WHERE {' AND '.join(where_parts)};"
         )
     return statements
 
 
-def build_delete_rollback(table, rows):
+def build_delete_rollback(table, rows, driver):
     statements = []
     for row in rows:
         columns = list(row.keys())
-        values = [sql_value_literal(row[col]) for col in columns]
+        values = [sql_value_literal(row[col], driver) for col in columns]
         statements.append(
             f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(values)});"
         )
     return statements
 
 
-def build_key_disjunction(key_columns, rows):
+def build_key_disjunction(key_columns, rows, driver):
     """Build an OR of per-row AND-of-key predicates, to re-select exact rows."""
     groups = []
     for row in rows:
@@ -384,7 +412,7 @@ def build_key_disjunction(key_columns, rows):
                 raise UnsafeSqlError(
                     f"Key column '{key}' is absent from the snapshot; cannot build a post-check."
                 )
-            parts.append(key_predicate(key, row[key]))
+            parts.append(key_predicate(key, row[key], driver))
         groups.append("(" + " AND ".join(parts) + ")")
     return " OR ".join(groups)
 
@@ -420,13 +448,9 @@ def maybe_add_limit_with_cap(sql, token, limit, limit_style, no_auto_limit, hard
     return f"{limited_sql} LIMIT {requested_limit}"
 
 
-def sql_literal(value):
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def append_filter(clauses, column, value, operator="="):
+def append_filter(clauses, column, value, driver, operator="="):
     if value:
-        clauses.append(f"{column} {operator} {sql_literal(value)}")
+        clauses.append(f"{column} {operator} {sql_literal(value, driver)}")
 
 
 def where_clause(clauses):
@@ -449,7 +473,7 @@ def build_search_objects_sql(env, args):
 
     if driver in {"mysql", "mariadb"}:
         if object_type == "schema":
-            clauses = [f"SCHEMA_NAME LIKE {sql_literal(pattern)}"]
+            clauses = [f"SCHEMA_NAME LIKE {sql_literal(pattern, driver)}"]
             columns = "SCHEMA_NAME AS schema_name"
             if detail_level in {"summary", "full"}:
                 columns += ", DEFAULT_CHARACTER_SET_NAME AS default_character_set_name, DEFAULT_COLLATION_NAME AS default_collation_name"
@@ -460,8 +484,8 @@ def build_search_objects_sql(env, args):
                 "ORDER BY SCHEMA_NAME"
             )
         if object_type == "table":
-            clauses = [f"TABLE_NAME LIKE {sql_literal(pattern)}"]
-            append_filter(clauses, "TABLE_SCHEMA", schema_filter)
+            clauses = [f"TABLE_NAME LIKE {sql_literal(pattern, driver)}"]
+            append_filter(clauses, "TABLE_SCHEMA", schema_filter, driver)
             if detail_level == "names":
                 columns = "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name"
             elif detail_level == "full":
@@ -482,9 +506,9 @@ def build_search_objects_sql(env, args):
                 "ORDER BY TABLE_SCHEMA, TABLE_NAME"
             )
         if object_type == "column":
-            clauses = [f"COLUMN_NAME LIKE {sql_literal(pattern)}"]
-            append_filter(clauses, "TABLE_SCHEMA", schema_filter)
-            append_filter(clauses, "TABLE_NAME", table_filter)
+            clauses = [f"COLUMN_NAME LIKE {sql_literal(pattern, driver)}"]
+            append_filter(clauses, "TABLE_SCHEMA", schema_filter, driver)
+            append_filter(clauses, "TABLE_NAME", table_filter, driver)
             if detail_level == "names":
                 columns = "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name"
             elif detail_level == "full":
@@ -508,9 +532,9 @@ def build_search_objects_sql(env, args):
                 "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
             )
         if object_type == "index":
-            clauses = [f"INDEX_NAME LIKE {sql_literal(pattern)}"]
-            append_filter(clauses, "TABLE_SCHEMA", schema_filter)
-            append_filter(clauses, "TABLE_NAME", table_filter)
+            clauses = [f"INDEX_NAME LIKE {sql_literal(pattern, driver)}"]
+            append_filter(clauses, "TABLE_SCHEMA", schema_filter, driver)
+            append_filter(clauses, "TABLE_NAME", table_filter, driver)
             if detail_level == "names":
                 columns = "TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, INDEX_NAME AS index_name"
             elif detail_level == "full":
@@ -532,9 +556,9 @@ def build_search_objects_sql(env, args):
                 "ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
             )
         if object_type in {"procedure", "function"}:
-            clauses = [f"ROUTINE_NAME LIKE {sql_literal(pattern)}"]
-            append_filter(clauses, "ROUTINE_SCHEMA", schema_filter)
-            clauses.append(f"ROUTINE_TYPE = {sql_literal(object_type.upper())}")
+            clauses = [f"ROUTINE_NAME LIKE {sql_literal(pattern, driver)}"]
+            append_filter(clauses, "ROUTINE_SCHEMA", schema_filter, driver)
+            clauses.append(f"ROUTINE_TYPE = {sql_literal(object_type.upper(), driver)}")
             if detail_level == "names":
                 columns = "ROUTINE_SCHEMA AS routine_schema, ROUTINE_NAME AS routine_name, ROUTINE_TYPE AS routine_type"
             elif detail_level == "full":
@@ -558,7 +582,7 @@ def build_search_objects_sql(env, args):
             )
 
     if object_type == "schema":
-        clauses = [f"schema_name LIKE {sql_literal(pattern)}"]
+        clauses = [f"schema_name LIKE {sql_literal(pattern, driver)}"]
         columns = "schema_name"
         if detail_level in {"summary", "full"}:
             columns += ", catalog_name, schema_owner"
@@ -569,8 +593,8 @@ def build_search_objects_sql(env, args):
             "ORDER BY schema_name"
         )
     if object_type == "table":
-        clauses = [f"table_name LIKE {sql_literal(pattern)}"]
-        append_filter(clauses, "table_schema", schema_filter)
+        clauses = [f"table_name LIKE {sql_literal(pattern, driver)}"]
+        append_filter(clauses, "table_schema", schema_filter, driver)
         if detail_level == "names":
             columns = "table_schema, table_name"
         elif detail_level == "full":
@@ -584,9 +608,9 @@ def build_search_objects_sql(env, args):
             "ORDER BY table_schema, table_name"
         )
     if object_type == "column":
-        clauses = [f"column_name LIKE {sql_literal(pattern)}"]
-        append_filter(clauses, "table_schema", schema_filter)
-        append_filter(clauses, "table_name", table_filter)
+        clauses = [f"column_name LIKE {sql_literal(pattern, driver)}"]
+        append_filter(clauses, "table_schema", schema_filter, driver)
+        append_filter(clauses, "table_name", table_filter, driver)
         if detail_level == "names":
             columns = "table_schema, table_name, column_name"
         elif detail_level == "full":
@@ -603,9 +627,9 @@ def build_search_objects_sql(env, args):
             "ORDER BY table_schema, table_name, ordinal_position"
         )
     if object_type == "index":
-        clauses = [f"indexname LIKE {sql_literal(pattern)}"]
-        append_filter(clauses, "schemaname", schema_filter)
-        append_filter(clauses, "tablename", table_filter)
+        clauses = [f"indexname LIKE {sql_literal(pattern, driver)}"]
+        append_filter(clauses, "schemaname", schema_filter, driver)
+        append_filter(clauses, "tablename", table_filter, driver)
         if detail_level == "names":
             columns = "schemaname AS table_schema, tablename AS table_name, indexname AS index_name"
         else:
@@ -620,9 +644,9 @@ def build_search_objects_sql(env, args):
             "ORDER BY schemaname, tablename, indexname"
         )
     if object_type in {"procedure", "function"}:
-        clauses = [f"routine_name LIKE {sql_literal(pattern)}"]
-        append_filter(clauses, "routine_schema", schema_filter)
-        clauses.append(f"routine_type = {sql_literal(object_type.upper())}")
+        clauses = [f"routine_name LIKE {sql_literal(pattern, driver)}"]
+        append_filter(clauses, "routine_schema", schema_filter, driver)
+        clauses.append(f"routine_type = {sql_literal(object_type.upper(), driver)}")
         if detail_level == "names":
             columns = "routine_schema, routine_name, routine_type"
         elif detail_level == "full":
@@ -640,57 +664,6 @@ def build_search_objects_sql(env, args):
         )
 
     raise ConfigError(f"Unsupported object type '{object_type}'.")
-
-
-def config_paths(explicit_path):
-    if explicit_path:
-        return [Path(explicit_path).expanduser()]
-    env_path = os.environ.get("DATABASE_CLI_CONFIG")
-    if env_path:
-        return [Path(env_path).expanduser()]
-    return DEFAULT_CONFIG_PATHS
-
-
-def load_config(explicit_path):
-    for path in config_paths(explicit_path):
-        if path.exists():
-            with path.open("r", encoding="utf-8") as handle:
-                return json.load(handle), path
-    paths = ", ".join(str(path) for path in config_paths(explicit_path))
-    raise ConfigError(f"No config file found. Checked: {paths}")
-
-
-def parse_database_url(raw_url):
-    if not raw_url:
-        return {}
-    if "://" not in raw_url:
-        return {"host": raw_url}
-
-    parsed = urlparse(raw_url)
-    values = {}
-    if parsed.scheme:
-        scheme = parsed.scheme.lower()
-        values["driver"] = "sqlite3" if scheme == "sqlite" else scheme
-    if parsed.hostname:
-        values["host"] = parsed.hostname
-    if parsed.port:
-        values["port"] = parsed.port
-    if parsed.username:
-        values["username"] = unquote(parsed.username)
-    if parsed.password:
-        values["password"] = unquote(parsed.password)
-
-    path = unquote(parsed.path.lstrip("/"))
-    if path:
-        if values.get("driver") in {"sqlite3", "duckdb"}:
-            values["path"] = unquote(parsed.path)
-        else:
-            values["database"] = path
-
-    params = {key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
-    if params:
-        values["params"] = params
-    return values
 
 
 AD_HOC_CONNECTION_FIELDS = {
@@ -884,15 +857,6 @@ def get_env(config, env_name):
     return canonical_name, env
 
 
-def alias_values(env):
-    aliases = env.get("aliases", [])
-    if isinstance(aliases, str):
-        return [aliases]
-    if isinstance(aliases, list):
-        return [str(alias) for alias in aliases if str(alias)]
-    return []
-
-
 def resolve_env_name(config, requested):
     envs = config.get("environments", {})
     if requested in envs:
@@ -925,7 +889,7 @@ SAFE_CONNECTION_FIELDS = [
     "schema",
     "source",
     "max_rows",
-    "readonly",
+    "max_write_rows",
     "limit_style",
 ]
 
@@ -937,8 +901,12 @@ def connection_summary(name, env):
             summary[field] = env[field]
     if "aliases" in summary:
         summary["aliases"] = alias_values(env)
-    if "readonly" not in summary:
-        summary["readonly"] = True
+    # Report what the write policy actually is. The old unconditional
+    # "readonly": true told every caller the connection was read-only while
+    # --allow-write went through regardless.
+    summary["writable"] = bool_value(env.get("writable"), False)
+    if summary["writable"]:
+        summary["max_write_rows"] = write_row_cap({}, env)
     return summary
 
 
@@ -962,9 +930,36 @@ def positive_int(value):
 
 def enforce_readonly(config, env, env_name):
     if not bool_value(config.get("readonly"), True):
-        raise ConfigError("Top-level readonly=false is not supported; database-cli only runs read-only queries.")
+        raise ConfigError("Top-level readonly=false is not supported; use \"writable\": true on the environments that may accept DML.")
     if not bool_value(env.get("readonly"), True):
-        raise ConfigError(f"Environment '{env_name}' sets readonly=false; database-cli only runs read-only queries.")
+        raise ConfigError(f"Environment '{env_name}' sets readonly=false; use \"writable\": true instead to allow DML.")
+
+
+def enforce_write_policy(config, env, env_name, args):
+    """Gate --allow-write on a declaration made outside this command line.
+
+    A configured environment must opt in with "writable": true, so the set of
+    writable databases is curated in a file rather than asserted by whoever
+    composed the call. Ad-hoc connections have no config entry to carry that
+    declaration, so they require an explicit --writable alongside --allow-write;
+    without it, re-describing a protected database as an ad-hoc connection would
+    route straight around its config entry.
+    """
+    if not args.allow_write:
+        return
+    if env_name == "adhoc":
+        if not getattr(args, "writable", False):
+            raise ConfigError(
+                "Ad-hoc connections are read-only unless --writable accompanies --allow-write. "
+                "Prefer a configured environment with \"writable\": true so the write policy "
+                "lives in the config file."
+            )
+        return
+    if not bool_value(env.get("writable"), False):
+        raise ConfigError(
+            f"Environment '{env_name}' is not writable. Add \"writable\": true to its config "
+            "entry to allow --allow-write; until then the environment is read-only."
+        )
 
 
 def configured_max_rows(config, env):
@@ -974,6 +969,16 @@ def configured_max_rows(config, env):
         if limit:
             limits.append(limit)
     return min(limits) if limits else 0
+
+
+def write_row_cap(config, env):
+    """Hard cap on how many rows a single approved UPDATE/DELETE may touch."""
+    caps = []
+    for value in (config.get("max_write_rows"), env.get("max_write_rows")):
+        cap = positive_int(value)
+        if cap:
+            caps.append(cap)
+    return min(caps) if caps else DEFAULT_MAX_WRITE_ROWS
 
 
 def env_value(env, *names):
@@ -1002,12 +1007,19 @@ def build_auth(username, password, include_password=True):
     return f"{auth}@"
 
 
+# Connection parameters that would undo this tool's guarantees. They are
+# refused rather than quietly dropped, so a config asking for one fails loudly
+# instead of appearing to take effect.
+DENIED_PARAM_KEYS = {
+    "multistatements": "it would allow several statements per call, defeating the single-statement check",
+    "allowallfiles": "it would let the server read arbitrary files from this host via LOAD DATA LOCAL INFILE",
+    "allowcleartextpasswords": "it would send the password in cleartext",
+    "allowoldpasswords": "it would enable the pre-4.1 password hash",
+    "allowfallbacktoplaintext": "it would silently fall back from TLS to an unencrypted connection",
+}
+
 MYSQL_PARAM_KEYS = {
-    "allowAllFiles",
-    "allowCleartextPasswords",
-    "allowFallbackToPlaintext",
     "allowNativePasswords",
-    "allowOldPasswords",
     "charset",
     "checkConnLiveness",
     "clientFoundRows",
@@ -1017,7 +1029,6 @@ MYSQL_PARAM_KEYS = {
     "interpolateParams",
     "loc",
     "maxAllowedPacket",
-    "multiStatements",
     "parseTime",
     "readTimeout",
     "rejectReadOnly",
@@ -1048,6 +1059,18 @@ POSTGRES_PARAM_KEYS = {
 }
 
 
+def reject_denied_params(params):
+    """Refuse connection parameters that would defeat the safety wrapper.
+
+    Only an enabling value is refused; `multiStatements=false` is exactly what
+    this tool wants anyway.
+    """
+    for key, value in (params or {}).items():
+        reason = DENIED_PARAM_KEYS.get(str(key).strip().lower())
+        if reason and bool_value(value, False):
+            raise ConfigError(f"Connection parameter '{key}' is not allowed: {reason}.")
+
+
 def filter_params(driver, params):
     if driver in {"mysql", "mariadb"}:
         return {key: value for key, value in params.items() if key in MYSQL_PARAM_KEYS}
@@ -1070,6 +1093,9 @@ def host_port(host, port):
 
 
 def build_direct_dsn(env, include_password=True):
+    # Checked here rather than in filter_params: the sqlserver branch below
+    # builds its query string directly and never calls it.
+    reject_denied_params(env.get("params"))
     driver = env_value(env, "driver", "type").lower()
     database = env_value(env, "database", "db")
     path = env_value(env, "path", "file")
@@ -1169,10 +1195,20 @@ def audit_user():
 
 
 def write_audit(path, entry):
+    """Append one audit record, owner-readable only.
+
+    The log stores executed SQL verbatim, and WHERE clauses routinely carry
+    personal data (order numbers, phone numbers, account ids), so it must not
+    inherit the default umask the way it used to.
+    """
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            # Tighten a log left world-readable by an earlier version.
+            os.chmod(path, 0o600)
     except OSError as exc:
         print(f"db-query: audit log write failed: {exc}", file=sys.stderr)
 
@@ -1269,8 +1305,14 @@ def build_inspect_command(args, config, env, source, sq_config_override=None):
     return cmd
 
 
+# sq reads stdin as query input when it is not a terminal, so an inherited
+# stdin makes it consume — or block on — whatever the caller was reading. Under
+# the MCP adapter that stdin is the still-open JSON-RPC pipe, which hung every
+# real query until the timeout fired. sq only ever gets input we hand it.
 def run_command(cmd, timeout, secrets=None):
-    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    proc = subprocess.run(
+        cmd, text=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False
+    )
     secrets = secrets or []
     if proc.stdout:
         sys.stdout.write(redact(proc.stdout, secrets))
@@ -1280,16 +1322,20 @@ def run_command(cmd, timeout, secrets=None):
 
 
 def run_capture(cmd, timeout, secrets=None):
-    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    proc = subprocess.run(
+        cmd, text=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False
+    )
     secrets = secrets or []
     return proc.returncode, redact(proc.stdout, secrets), redact(proc.stderr, secrets)
 
 
 def run_internal_command(cmd, timeout, secrets, input_text=None):
+    # `input` and `stdin` are mutually exclusive; input_text already isolates it.
+    stdin_args = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
     proc = subprocess.run(
         cmd,
         text=True,
-        input=input_text,
+        **stdin_args,
         capture_output=True,
         timeout=timeout,
         check=False,
@@ -1395,6 +1441,7 @@ def parse_args():
     parser.add_argument("--max-rows", type=int, help="Hard maximum rows for ad-hoc SELECT/WITH queries.")
     parser.add_argument("--no-auto-limit", action="store_true", help="Do not append LIMIT to SELECT/WITH queries.")
     parser.add_argument("--allow-write", action="store_true", help="Allow DML SQL after explicit user approval. DDL, transactions, procedures, locks, exports, and other side effects remain blocked.")
+    parser.add_argument("--writable", action="store_true", help="Declare an ad-hoc connection writable. Required alongside --allow-write for --url/--host connections; configured environments declare \"writable\": true in config instead.")
     parser.add_argument("--print-command", action="store_true", help="Print the sq command instead of executing it.")
     parser.add_argument("--audit-log", help="Path to the append-only audit log. Overrides DATABASE_CLI_AUDIT_LOG and config 'audit_log'.")
     parser.add_argument("--no-audit", action="store_true", help="Disable audit logging for this call.")
@@ -1458,6 +1505,45 @@ def run_impact(count_cmd, snapshot_cmd, secrets, timeout):
     except json.JSONDecodeError:
         rows = []
     return 0, affected, rows, None
+
+
+def check_write_cap(affected, cap, token):
+    if affected > cap:
+        raise UnsafeSqlError(
+            f"{token.upper()} would affect {affected} rows, above this environment's "
+            f"{cap}-row write cap. Narrow the WHERE clause, or raise 'max_write_rows' "
+            "in the config."
+        )
+
+
+def enforce_write_scope(args, config, env, statement, token, source, sq_config, cap):
+    """Refuse an UPDATE/DELETE whose real blast radius exceeds the cap.
+
+    validate_sql only checks that the word WHERE appears somewhere, so `WHERE
+    1=1` satisfies it while still hitting every row. Counting the matched rows
+    on the server is the only measure that reflects what the write will do.
+    """
+    target = parse_write_target(statement, token)
+    if not target:
+        raise UnsafeSqlError(
+            f"{token.upper()} needs a top-level WHERE clause whose scope can be counted "
+            "before execution. A WHERE that appears only inside a subquery does not "
+            "bound the statement."
+        )
+    from_expr, where_expr = target
+    count_sql = f"SELECT COUNT(*) AS affected_rows FROM {from_expr} WHERE {where_expr}"
+    validate_sql(count_sql, allow_write=False)
+
+    cmd = build_sql_command(args, config, env, count_sql, source, sq_config, fmt="json")
+    rc, out, err = run_capture(cmd, args.timeout, env_secrets(env))
+    if rc != 0:
+        sys.stderr.write(err or out)
+        raise UnsafeSqlError("Could not count the affected rows; refusing to execute the write.")
+    affected = parse_count_result(out)
+    if affected is None:
+        raise UnsafeSqlError("Could not read the affected-row count; refusing to execute the write.")
+    check_write_cap(affected, cap, token)
+    return affected
 
 
 def parse_write_or_raise(statement, flag_name):
@@ -1588,10 +1674,11 @@ def generate_rollback(args, config, env, env_name, max_rows):
                     f"{len(rows)} were captured (max_rows cap). Narrow the WHERE clause or raise max_rows."
                 )
 
+            driver = env_value(env, "driver", "type")
             if token == "update":
-                rollback_sql = build_update_rollback(table, set_columns, key_columns, rows)
+                rollback_sql = build_update_rollback(table, set_columns, key_columns, rows, driver)
             else:
-                rollback_sql = build_delete_rollback(table, rows)
+                rollback_sql = build_delete_rollback(table, rows, driver)
 
             envelope = {
                 "rollback": True,
@@ -1684,15 +1771,19 @@ def repair(args, config, env, env_name, max_rows):
                     f"Refusing to build a repair package: {affected} rows match but only "
                     f"{len(rows)} were captured (max_rows cap). Narrow the WHERE clause or raise max_rows."
                 )
+            if args.allow_write:
+                # A read-only package is planning material; only execution is capped.
+                check_write_cap(affected, write_row_cap(config, env), token)
 
+            driver = env_value(env, "driver", "type")
             if token == "update":
-                rollback_sql = build_update_rollback(table, set_columns, key_columns, rows)
+                rollback_sql = build_update_rollback(table, set_columns, key_columns, rows, driver)
                 if rows:
-                    post_check_sql = f"SELECT * FROM {table} WHERE {build_key_disjunction(key_columns, rows)}"
+                    post_check_sql = f"SELECT * FROM {table} WHERE {build_key_disjunction(key_columns, rows, driver)}"
                 else:
                     post_check_sql = f"SELECT COUNT(*) AS remaining FROM {table} WHERE {where_expr}"
             else:
-                rollback_sql = build_delete_rollback(table, rows)
+                rollback_sql = build_delete_rollback(table, rows, driver)
                 post_check_sql = f"SELECT COUNT(*) AS remaining FROM {table} WHERE {where_expr}"
             validate_sql(post_check_sql, allow_write=False)
 
@@ -1789,6 +1880,7 @@ def main():
 
         config, path, env_name, env = runtime_connection(args)
         enforce_readonly(config, env, env_name)
+        enforce_write_policy(config, env, env_name, args)
         max_rows = configured_max_rows(config, env)
 
         if args.preview_write:
@@ -1815,6 +1907,10 @@ def main():
                 max_rows,
             )
             source, sq_config, setup = prepare_source(args, config, env, env_name)
+            if args.allow_write and token in {"update", "delete"} and not args.print_command:
+                enforce_write_scope(
+                    args, config, env, args.sql, token, source, sq_config, write_row_cap(config, env)
+                )
             cmd = build_sql_command(args, config, env, sql, source, sq_config)
             audit_event = "sql"
             audit_statement = sql

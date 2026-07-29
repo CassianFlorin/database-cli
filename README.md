@@ -29,6 +29,8 @@
 - 支持对象搜索：schema、table、column、index、procedure/function metadata，并支持 `names`、`summary`、`full` 三档详情。
 - 支持配置级 `max_rows` 上限；`readonly=false` 会被拒绝，不会用配置隐式打开写权限。
 - 默认拦截写入；用户明确允许后可用 `--allow-write` 执行 `INSERT`、`UPDATE`、`DELETE`、`REPLACE`。DDL、权限、事务、过程、锁、导出和副作用 SQL 仍会被拦截。
+- 写权限由配置声明，不由命令行声明：环境必须写明 `"writable": true` 才接受 `--allow-write`，临时连接（`--url`/`--host`）则需要额外的 `--writable`，避免把受保护的库改写成临时连接绕过配置。
+- 已批准的 `UPDATE`/`DELETE` 在执行前会先 COUNT 实际影响行数，超过 `max_write_rows`（默认 1000）直接拒绝，`WHERE 1=1` 这类看似有 WHERE 实则全表的语句不会放行。
 - 避免把密码写入命令行 DSN；本地密钥文件不提交到仓库。
 
 ## 目录结构

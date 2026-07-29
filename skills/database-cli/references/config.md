@@ -109,15 +109,17 @@ Fields:
 - `username`: Optional if the database allows anonymous access.
 - `password`: Optional. Store only in ignored local files.
 - `password_env`: Optional. Name of an environment variable containing the password; preferred for production credentials.
-- `params`: Optional object of URL query parameters. The query wrapper filters parameters by driver before creating the temporary `sq` source.
-- `source`: Optional advanced mode. Use an existing `sq` source handle such as `@qnvip_qa01_commerce`; if present, direct connection fields are ignored.
+- `params`: Optional object of URL query parameters. The query wrapper filters parameters by driver before creating the temporary `sq` source. A few are refused outright rather than dropped, because they would undo the wrapper's guarantees from the outside: `multiStatements` (defeats the single-statement check), `allowAllFiles` (enables `LOAD DATA LOCAL INFILE` against this host's filesystem), `allowCleartextPasswords`, `allowOldPasswords`, and `allowFallbackToPlaintext`. Only an enabling value is refused; `multiStatements=false` is accepted.
+- `source`: Optional advanced mode. Use an existing `sq` source handle such as `@qnvip_qa01_commerce`; if present, direct connection fields are ignored. Set `driver` alongside it anyway: generated rollback SQL has to quote string values, and MySQL-family drivers read a backslash inside a literal as an escape while standard SQL reads it as an ordinary character. Without `driver`, a value containing a backslash is refused rather than quoted the wrong way.
 - `schema`: Optional. Passed as `--src.schema`; avoid setting it when the user should choose the database/schema in each SQL statement.
 - `sq_config`: Optional at top level or per environment. Passed to `sq --config`.
 - `limit_style`: Optional. Use `limit` for MySQL/Postgres/SQLite/DuckDB. Use `none` if the database does not accept appended `LIMIT`.
 - `max_rows`: Optional positive integer at top level or per environment. It is a hard cap for auto-appended limits and larger existing `LIMIT` clauses.
-- `readonly`: Optional boolean. Only `true` or omitted is supported. `false` is rejected because this skill never executes write SQL.
+- `writable`: Optional boolean, default `false`. An environment refuses `--allow-write` until this is `true`. It is the only way to grant DML, and it lives in the config file on purpose: whoever composes a command cannot assert it. `scripts/init-config --writable` sets it; the MCP `add_connection` tool deliberately cannot, so a running Agent cannot grant itself write access.
+- `max_write_rows`: Optional positive integer at top level or per environment, default `1000`. An approved `UPDATE`/`DELETE` is counted before it runs and refused above this cap. The smaller of the top-level and per-environment values wins.
+- `readonly`: Optional boolean. Only `true` or omitted is supported; `false` is rejected. Note that `true` grants nothing — it is the default posture, and writability is controlled solely by `writable`.
 - `audit`: Optional boolean at top level or per environment. Defaults to `true`. Set `false` to disable audit logging. A per-environment value overrides the top-level value.
-- `audit_log`: Optional path at top level or per environment. Overrides the default `~/.local/state/database-cli/audit.log`. The `--audit-log` flag and `DATABASE_CLI_AUDIT_LOG` environment variable take precedence over config.
+- `audit_log`: Optional path at top level or per environment. Overrides the default `~/.local/state/database-cli/audit.log`. The `--audit-log` flag and `DATABASE_CLI_AUDIT_LOG` environment variable take precedence over config. The log file is created mode `0600` and its directory `0700`, and a log left group/world-readable by an earlier version is tightened on the next write: it stores executed SQL, and WHERE clauses routinely carry personal data.
 
 ## Optional MCP Custom Tools
 

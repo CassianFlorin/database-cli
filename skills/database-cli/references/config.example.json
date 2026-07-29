@@ -20,6 +20,18 @@
       "password_env": "QNVIP_PROD_DB_PASSWORD",
       "max_rows": 100,
       "limit_style": "limit"
+    },
+    "qa01_fix": {
+      "display_name": "QNVIP QA01 (repair)",
+      "description": "Same server as qa01, opted in to user-approved DML. Omit 'writable' to keep an environment read-only.",
+      "driver": "mysql",
+      "host": "mysql-qa01.example.internal",
+      "username": "repair_user",
+      "password_env": "QA01_REPAIR_DB_PASSWORD",
+      "max_rows": 200,
+      "writable": true,
+      "max_write_rows": 50,
+      "limit_style": "limit"
     }
   },
   "tools": {

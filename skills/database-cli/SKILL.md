@@ -77,7 +77,8 @@ scripts/db-query --check-sql "SELECT id FROM cc_order WHERE order_no = 'YP...'"
 
 - Confirm the target environment/connection before querying. If the environment is missing or ambiguous, list configured environments and connection metadata, then ask the user to choose.
 - Do not require the user to preselect a database/schema. A configured environment represents a database server or account permission boundary, not one database. Search visible schema/table metadata first, then narrow with `--schema` only when needed.
-- Default to read-only: `SELECT`, `SHOW`, `DESC`/`DESCRIBE`, `EXPLAIN`, and conservative read-only `WITH ... SELECT` queries.
+- Default to read-only: `SELECT`, `SHOW`, `DESC`/`DESCRIBE`, `EXPLAIN`, and conservative read-only `WITH ... SELECT` queries. `SHOW CREATE TABLE`, `SHOW GRANTS`, and the other `SHOW` forms that name a reserved word are read-only and accepted.
+- `EXPLAIN ANALYZE` over `INSERT`/`UPDATE`/`DELETE`/`REPLACE` is always refused, including with `--allow-write`: MySQL 8.0.18+ executes the statement for real, and an `EXPLAIN` bypasses every guard that keys off the first token (the `WHERE` requirement, the affected-row cap, and the audit read/write split). `EXPLAIN ANALYZE SELECT` is fine.
 - Execute write SQL only when the user explicitly asks/approves it in the current task, and only with `--allow-write` or MCP `allow_write=true`.
 - With write approval, allow only DML starts: `INSERT`, `UPDATE`, `DELETE`, `REPLACE`.
 - Approved `UPDATE` and `DELETE` statements must include `WHERE` and must be scoped to exact business keys or primary keys.
@@ -87,7 +88,10 @@ scripts/db-query --check-sql "SELECT id FROM cc_order WHERE order_no = 'YP...'"
 - If an Agent needs structured MCP tools, use `scripts/database-mcp`; it delegates to `scripts/db-query` and preserves the same safety boundary.
 - Do not treat this project as a DBHub replacement or MCP platform. Prefer improving CLI and Skill workflow first; keep MCP thin.
 - Treat configured `max_rows` as a hard result cap. Do not bypass it with larger `--limit` values.
-- Treat `readonly=false` as invalid for this skill; it never enables write SQL.
+- `--allow-write` alone is never enough. A configured environment must declare `"writable": true` in the config file; without it the environment refuses DML, and that refusal is not something a tool call can override. Ask the user to add the flag to their config rather than working around it.
+- Ad-hoc (`--url`/`--host`) connections additionally require `--writable` (MCP `writable: true`) next to `--allow-write`. Never re-describe a configured environment as an ad-hoc connection to get around its config entry; if an environment is not writable, that is the answer.
+- Approved `UPDATE`/`DELETE` are counted before they run and refused above `max_write_rows` (default 1000). A refusal means the statement's real scope is wider than intended — treat it as a stop condition and narrow the `WHERE` clause, not as a cap to raise.
+- Treat `readonly=false` as invalid for this skill; it is rejected outright. Use `"writable": true` to grant DML instead.
 - Configured MCP custom tools are allowed only for parameterized read-only SQL templates. Do not put repair SQL in a custom tool.
 - If data must be repaired and the user has not explicitly allowed Agent execution, output SQL for a human to execute. Include target environment, pre-check SQL, change SQL, post-check SQL, and rollback or recovery notes. Prefer `--generate-rollback` over hand-writing the reverse SQL.
 - If the user explicitly allows Agent execution, run the pre-check first, execute exactly one DML statement with `--allow-write`, then run the post-check and report the affected evidence.
@@ -227,6 +231,8 @@ It prints one JSON object: `affected_rows` (exact count), `snapshot` (the matche
 ## Generate Rollback
 
 `--generate-rollback` produces — but never executes — the SQL that would undo an `UPDATE`/`DELETE`, built from the current before-image. It only runs read-only SELECTs; the rollback is output for a human to review and run.
+
+String values are quoted for the environment's `driver`, because MySQL, MariaDB, and ClickHouse read a backslash inside a literal as an escape while the other drivers read it literally. If an environment has no `driver` (a `source`-only entry), a value containing a backslash is refused rather than quoted the wrong way — add `driver` to the config instead of hand-editing the emitted SQL. Values that have no faithful literal form (`NaN`, `Infinity`) are refused for the same reason: a rollback that silently restores something else is worse than no rollback.
 
 ```bash
 scripts/db-query --env qa01 --generate-rollback "UPDATE cc_order SET status = 1 WHERE id = 10" --key-columns id

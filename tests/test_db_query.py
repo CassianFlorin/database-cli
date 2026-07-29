@@ -1,3 +1,5 @@
+import importlib.machinery
+import importlib.util
 import json
 import shlex
 import subprocess
@@ -426,7 +428,14 @@ class AuditLogTest(unittest.TestCase):
 
     def make_fake_sq(self, tmpdir):
         fake = Path(tmpdir) / "fake-sq"
-        fake.write_text("#!/usr/bin/env python3\nprint('[]')\n", encoding="utf-8")
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "sql = sys.argv[-1] if len(sys.argv) > 1 else ''\n"
+            # The pre-write row count needs a parseable answer.
+            "print(json.dumps([{'affected_rows': 1}]) if 'COUNT(*)' in sql else '[]')\n",
+            encoding="utf-8",
+        )
         fake.chmod(0o755)
         return fake
 
@@ -482,6 +491,7 @@ class AuditLogTest(unittest.TestCase):
             result, audit = self.run_db_query(
                 tmpdir,
                 ["--sql", "UPDATE cc_order SET status = 1 WHERE id = 1"],
+                env={"source": "@qa01", "driver": "mysql", "writable": True},
                 extra=["--allow-write"],
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -802,6 +812,31 @@ class GenerateRollbackTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("partial rollback", result.stderr.lower())
 
+    def test_backslash_values_are_escaped_for_the_configured_driver(self):
+        rows = [{"id": 1, "note": "ends with \\"}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self.run_rollback(
+                tmpdir, "UPDATE t SET note = 'x' WHERE id = 1", rows,
+                extra=["--key-columns", "id"],
+                env={"source": "@qa01", "driver": "mysql"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout)["rollback_sql"],
+                ["UPDATE t SET note = 'ends with \\\\' WHERE id = 1;"],
+            )
+
+    def test_backslash_values_are_refused_when_the_driver_is_unknown(self):
+        rows = [{"id": 1, "note": "ends with \\"}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, _ = self.run_rollback(
+                tmpdir, "UPDATE t SET note = 'x' WHERE id = 1", rows,
+                extra=["--key-columns", "id"],
+                env={"source": "@qa01"},
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("without knowing the driver", result.stderr)
+
     def test_composite_key_and_multi_column_set(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             rows = [{"tenant": 7, "id": 1, "a": "x", "b": 2}]
@@ -843,8 +878,8 @@ class RepairTest(unittest.TestCase):
         fake.chmod(0o755)
         return fake
 
-    def run_repair(self, tmpdir, dml, rows, count=None, extra=None):
-        config = self.write_config(tmpdir, {"source": "@qa01", "driver": "mysql"})
+    def run_repair(self, tmpdir, dml, rows, count=None, extra=None, env=None):
+        config = self.write_config(tmpdir, env or {"source": "@qa01", "driver": "mysql", "writable": True})
         fake = self.make_fake_sq(tmpdir, rows, count)
         audit = Path(tmpdir) / "audit.log"
         cmd = [
@@ -899,6 +934,31 @@ class RepairTest(unittest.TestCase):
             self.assertEqual(entry["mode"], "write")
             self.assertTrue(entry["executed"])
 
+    def test_execution_is_refused_above_the_write_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [{"id": 1, "status": 0}, {"id": 2, "status": 0}]
+            result, _ = self.run_repair(
+                tmpdir, "UPDATE cc_order SET status = 1 WHERE status = 0", rows,
+                extra=["--key-columns", "id", "--allow-write"],
+                env={"source": "@qa01", "driver": "mysql", "writable": True, "max_write_rows": 1},
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("would affect 2 rows", result.stderr)
+            self.assertIn("1-row write cap", result.stderr)
+
+    def test_readonly_package_is_not_capped(self):
+        # A package for human review is planning material; only execution is capped.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [{"id": 1, "status": 0}, {"id": 2, "status": 0}]
+            result, _ = self.run_repair(
+                tmpdir, "UPDATE cc_order SET status = 1 WHERE status = 0", rows,
+                extra=["--key-columns", "id"],
+                env={"source": "@qa01", "driver": "mysql", "max_write_rows": 1},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(json.loads(result.stdout)["executed"])
+
+
     def test_delete_repair_uses_remaining_count_post_check(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             rows = [{"id": 1, "note": None}]
@@ -941,6 +1001,490 @@ class RepairTest(unittest.TestCase):
             self.assertIn("COUNT(*)", sq_lines[0])
             self.assertIn("SELECT * FROM cc_order WHERE id = 7", shlex.split(sq_lines[1])[-1])
             self.assertEqual(shlex.split(sq_lines[2])[-1], "DELETE FROM cc_order WHERE id = 7")
+
+
+class DeniedConnectionParamTest(unittest.TestCase):
+    """Some driver parameters would undo the wrapper's guarantees from the outside."""
+
+    def run_with_param(self, param):
+        return subprocess.run(
+            [
+                str(DB_QUERY),
+                "--url", f"mysql://mysql-qa01.example.internal/db?{param}",
+                "--username", "readonly_user",
+                "--print-command",
+                "--sql", "SELECT 1",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_multi_statements_is_refused(self):
+        result = self.run_with_param("multiStatements=true")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("multiStatements", result.stderr)
+        self.assertIn("single-statement check", result.stderr)
+
+    def test_local_file_access_is_refused(self):
+        result = self.run_with_param("allowAllFiles=true")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("LOAD DATA LOCAL INFILE", result.stderr)
+
+    def test_credential_weakening_params_are_refused(self):
+        for param in ("allowCleartextPasswords=true", "allowOldPasswords=true",
+                      "allowFallbackToPlaintext=true"):
+            with self.subTest(param=param):
+                result = self.run_with_param(param)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("is not allowed", result.stderr)
+
+    def test_matching_is_case_insensitive(self):
+        result = self.run_with_param("MULTISTATEMENTS=true")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is not allowed", result.stderr)
+
+    def test_disabling_value_is_accepted(self):
+        # multiStatements=false is what this tool wants anyway.
+        result = self.run_with_param("multiStatements=false")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ordinary_params_still_pass_through(self):
+        result = self.run_with_param("charset=utf8mb4")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("charset=utf8mb4", result.stdout)
+
+    def test_denied_param_in_config_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / "connections.local.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "environments": {
+                            "qa01": {
+                                "driver": "mysql",
+                                "host": "h",
+                                "username": "u",
+                                "params": {"multiStatements": "true"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [str(DB_QUERY), "--config", str(config), "--env", "qa01",
+                 "--print-command", "--sql", "SELECT 1"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is not allowed", result.stderr)
+
+    def test_sqlserver_params_are_checked_too(self):
+        """The sqlserver branch builds its query string without filter_params."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / "connections.local.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "environments": {
+                            "mssql": {
+                                "driver": "sqlserver",
+                                "host": "h",
+                                "username": "u",
+                                "params": {"allowAllFiles": "true"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [str(DB_QUERY), "--config", str(config), "--env", "mssql",
+                 "--print-command", "--sql", "SELECT 1"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is not allowed", result.stderr)
+
+
+class AuditLogPermissionTest(unittest.TestCase):
+    """The log stores executed SQL, whose WHERE clauses routinely carry personal data."""
+
+    def run_query(self, tmpdir, audit):
+        config = Path(tmpdir) / "connections.local.json"
+        config.write_text(
+            json.dumps({"environments": {"qa01": {"source": "@qa01", "driver": "mysql"}}}),
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [str(DB_QUERY), "--config", str(config), "--env", "qa01",
+             "--sq-bin", "/bin/echo", "--audit-log", str(audit), "--sql", "SELECT 1"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def mode(self, path):
+        import stat as stat_module
+
+        return stat_module.S_IMODE(path.stat().st_mode)
+
+    def test_new_log_and_directory_are_owner_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audit = Path(tmpdir) / "state" / "audit.log"
+            self.assertEqual(self.run_query(tmpdir, audit).returncode, 0)
+
+            self.assertEqual(self.mode(audit), 0o600)
+            self.assertEqual(self.mode(audit.parent), 0o700)
+
+    def test_log_left_world_readable_by_an_older_version_is_tightened(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audit = Path(tmpdir) / "audit.log"
+            audit.write_text("", encoding="utf-8")
+            audit.chmod(0o644)
+
+            self.assertEqual(self.run_query(tmpdir, audit).returncode, 0)
+            self.assertEqual(self.mode(audit), 0o600)
+
+    def test_entries_are_still_appended(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audit = Path(tmpdir) / "audit.log"
+            self.run_query(tmpdir, audit)
+            self.run_query(tmpdir, audit)
+
+            lines = [line for line in audit.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(json.loads(lines[0])["event"], "sql")
+
+
+class ShowStatementTest(unittest.TestCase):
+    """SHOW names objects whose names collide with the forbidden-keyword list."""
+
+    def check(self, sql, extra=None):
+        return subprocess.run(
+            [str(DB_QUERY), *(extra or []), "--check-sql", sql],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_show_create_table_is_allowed(self):
+        result = self.check("SHOW CREATE TABLE users")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "SHOW CREATE TABLE users")
+
+    def test_other_show_forms_naming_reserved_words_are_allowed(self):
+        for sql in (
+            "SHOW GRANTS FOR CURRENT_USER",
+            "SHOW ENGINE INNODB STATUS",
+            "SHOW CREATE VIEW v",
+            "SHOW CREATE PROCEDURE p",
+            "SHOW TABLE STATUS",
+            "SHOW BINARY LOGS",
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(self.check(sql).returncode, 0)
+
+    def test_show_still_rejects_side_effect_patterns(self):
+        result = self.check("SHOW CREATE TABLE users /* */ WHERE sleep(5)")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("blocked pattern", result.stderr)
+
+    def test_show_is_still_one_statement_only(self):
+        result = self.check("SHOW CREATE TABLE users; DROP TABLE users")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("exactly one statement", result.stderr)
+
+    def test_explain_analyze_update_stays_blocked(self):
+        """EXPLAIN ANALYZE UPDATE really executes the statement on MySQL 8, so
+        the relaxation must not extend from SHOW to EXPLAIN."""
+        result = self.check("EXPLAIN ANALYZE UPDATE cc_order SET status = 1 WHERE id = 1")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("blocked keyword", result.stderr)
+
+    def test_explain_hides_dml_from_every_first_token_guard(self):
+        """An EXPLAIN's first token is `explain`, so the WHERE requirement, the
+        affected-row cap, and the audit read/write split all skip it. Under
+        --allow-write the DML keywords used to be subtracted from the forbidden
+        set, which let `EXPLAIN ANALYZE DELETE FROM t` through with no WHERE at
+        all -- and MySQL 8.0.18+ executes it."""
+        for sql in (
+            "EXPLAIN ANALYZE DELETE FROM cc_order",
+            "EXPLAIN ANALYZE DELETE FROM cc_order WHERE id = 1",
+            "EXPLAIN ANALYZE UPDATE cc_order SET status = 1 WHERE id = 1",
+            "EXPLAIN DELETE FROM cc_order",
+        ):
+            with self.subTest(sql=sql):
+                result = self.check(sql, extra=["--allow-write"])
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("blocked keyword", result.stderr)
+
+    def test_explain_analyze_select_is_still_allowed(self):
+        for extra in ([], ["--allow-write"]):
+            with self.subTest(extra=extra):
+                result = self.check(
+                    "EXPLAIN ANALYZE SELECT id FROM cc_order WHERE id = 1", extra=extra
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class SqlLiteralTest(unittest.TestCase):
+    """Rollback literals must restore the original value on the target dialect.
+
+    MySQL reads a backslash inside a string literal as an escape, so
+    `'ends with \\'` swallowed the closing quote and shifted every following
+    value. Postgres reads it literally, where doubling would corrupt the value
+    instead — so one escaping rule cannot serve both.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        loader = importlib.machinery.SourceFileLoader(
+            "db_query", str(ROOT / "skills" / "database-cli" / "scripts" / "db-query")
+        )
+        spec = importlib.util.spec_from_loader("db_query", loader)
+        cls.mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.mod)
+
+    def test_mysql_escapes_the_backslash(self):
+        self.assertEqual(self.mod.sql_literal("ends with \\", "mysql"), "'ends with \\\\'")
+        self.assertEqual(self.mod.sql_literal("ends with \\", "mariadb"), "'ends with \\\\'")
+        self.assertEqual(self.mod.sql_literal("ends with \\", "clickhouse"), "'ends with \\\\'")
+
+    def test_standard_dialects_leave_the_backslash_alone(self):
+        for driver in ("postgres", "postgresql", "sqlite3", "duckdb", "sqlserver"):
+            with self.subTest(driver=driver):
+                self.assertEqual(self.mod.sql_literal("ends with \\", driver), "'ends with \\'")
+
+    def test_quote_doubling_applies_everywhere(self):
+        for driver in ("mysql", "postgres", ""):
+            with self.subTest(driver=driver):
+                self.assertEqual(self.mod.sql_literal("O'Brien", driver), "'O''Brien'")
+
+    def test_unknown_driver_refuses_only_backslash_values(self):
+        self.assertEqual(self.mod.sql_literal("plain value", ""), "'plain value'")
+        with self.assertRaises(self.mod.UnsafeSqlError) as ctx:
+            self.mod.sql_literal("a\\b", "")
+        self.assertIn("without knowing the driver", str(ctx.exception))
+
+    def test_mysql_escapes_an_embedded_nul(self):
+        self.assertEqual(self.mod.sql_literal("a\0b", "mysql"), "'a\\0b'")
+
+    def test_non_finite_floats_are_refused(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(self.mod.UnsafeSqlError):
+                    self.mod.sql_value_literal(value, "mysql")
+
+    def test_json_columns_round_trip_as_json_text(self):
+        self.assertEqual(
+            self.mod.sql_value_literal({"b": "x'y", "a": 1}, "mysql"),
+            "'{\"a\": 1, \"b\": \"x''y\"}'",
+        )
+
+    def test_scalars_keep_their_existing_forms(self):
+        self.assertEqual(self.mod.sql_value_literal(None, "mysql"), "NULL")
+        self.assertEqual(self.mod.sql_value_literal(True, "mysql"), "TRUE")
+        self.assertEqual(self.mod.sql_value_literal(7, "mysql"), "7")
+        self.assertEqual(self.mod.sql_value_literal(1.5, "mysql"), "1.5")
+
+    def test_rollback_statements_carry_the_escaping_end_to_end(self):
+        rows = [{"id": 1, "note": "ends with \\", "status": "old"}]
+        self.assertEqual(
+            self.mod.build_update_rollback("t", ["note"], ["id"], rows, "mysql"),
+            ["UPDATE t SET note = 'ends with \\\\' WHERE id = 1;"],
+        )
+        self.assertEqual(
+            self.mod.build_delete_rollback("t", rows, "postgres"),
+            ["INSERT INTO t (id, note, status) VALUES (1, 'ends with \\', 'old');"],
+        )
+
+    def test_key_predicates_escape_too(self):
+        rows = [{"id": "a\\b", "v": 1}]
+        self.assertEqual(
+            self.mod.build_key_disjunction(["id"], rows, "mysql"),
+            "(id = 'a\\\\b')",
+        )
+
+
+class WritePolicyTest(unittest.TestCase):
+    """--allow-write must be gated by a declaration made outside this command line.
+
+    The old code accepted `readonly: true` on an environment and still ran the
+    UPDATE, so an environment could not be marked never-writable at all.
+    """
+
+    def make_fake_sq(self, tmpdir, count=1):
+        fake = Path(tmpdir) / "fake-sq"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "sql = sys.argv[-1] if len(sys.argv) > 1 else ''\n"
+            f"print(json.dumps([{{'affected_rows': {count}}}]) if 'COUNT(*)' in sql else '[]')\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake
+
+    def run_write(self, tmpdir, env=None, count=1, args=None,
+                  sql="UPDATE cc_order SET status = 1 WHERE id = 1"):
+        cmd = [
+            str(DB_QUERY),
+            "--sq-bin", str(self.make_fake_sq(tmpdir, count)),
+            "--audit-log", str(Path(tmpdir) / "audit.log"),
+        ]
+        if env is not None:
+            config = Path(tmpdir) / "connections.local.json"
+            config.write_text(json.dumps({"environments": {"qa01": env}}), encoding="utf-8")
+            cmd.extend(["--config", str(config), "--env", "qa01"])
+        cmd.extend(args or [])
+        cmd.extend(["--allow-write", "--sql", sql])
+        return subprocess.run(cmd, text=True, capture_output=True, check=False)
+
+    def test_configured_environment_refuses_writes_without_the_declaration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(tmpdir, env={"source": "@qa01", "driver": "mysql"})
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is not writable", result.stderr)
+
+    def test_readonly_true_no_longer_lets_a_write_through(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(
+                tmpdir, env={"source": "@qa01", "driver": "mysql", "readonly": True}
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is not writable", result.stderr)
+
+    def test_declared_writable_environment_executes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(
+                tmpdir, env={"source": "@qa01", "driver": "mysql", "writable": True}
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ad_hoc_connection_refuses_writes_without_the_writable_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(tmpdir, args=["--host", "db.internal", "--username", "u"])
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Ad-hoc connections are read-only", result.stderr)
+
+    def test_ad_hoc_connection_executes_with_the_writable_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(
+                tmpdir, args=["--host", "db.internal", "--username", "u", "--writable"]
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_where_1_equals_1_is_caught_by_the_row_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(
+                tmpdir,
+                env={"source": "@qa01", "driver": "mysql", "writable": True},
+                count=50000,
+                sql="UPDATE cc_order SET status = 1 WHERE 1=1",
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("would affect 50000 rows", result.stderr)
+        self.assertIn("1000-row write cap", result.stderr)
+
+    def test_max_write_rows_narrows_the_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(
+                tmpdir,
+                env={"source": "@qa01", "driver": "mysql", "writable": True, "max_write_rows": 5},
+                count=6,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("would affect 6 rows", result.stderr)
+        self.assertIn("5-row write cap", result.stderr)
+
+    def test_write_at_the_cap_boundary_proceeds(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(
+                tmpdir,
+                env={"source": "@qa01", "driver": "mysql", "writable": True, "max_write_rows": 5},
+                count=5,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_where_confined_to_a_subquery_cannot_bound_the_write(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(
+                tmpdir,
+                env={"source": "@qa01", "driver": "mysql", "writable": True},
+                sql="UPDATE cc_order SET status = (SELECT 1 FROM dual WHERE 1=1)",
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("top-level WHERE", result.stderr)
+
+    def test_inserts_are_unaffected_by_the_row_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_write(
+                tmpdir,
+                env={"source": "@qa01", "driver": "mysql", "writable": True},
+                sql="INSERT INTO cc_order (id) VALUES (1)",
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_list_envs_reports_real_writability(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / "connections.local.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "environments": {
+                            "qa01": {"source": "@qa01", "driver": "mysql"},
+                            "fix": {
+                                "source": "@fix",
+                                "driver": "mysql",
+                                "writable": True,
+                                "max_write_rows": 25,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [str(DB_QUERY), "--config", str(config), "--list-envs"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summaries = {item["name"]: item for item in json.loads(result.stdout)["connections"]}
+        self.assertFalse(summaries["qa01"]["writable"])
+        self.assertTrue(summaries["fix"]["writable"])
+        self.assertEqual(summaries["fix"]["max_write_rows"], 25)
+        # The old summary claimed readonly:true on every connection, writable ones included.
+        self.assertNotIn("readonly", summaries["fix"])
 
 
 if __name__ == "__main__":

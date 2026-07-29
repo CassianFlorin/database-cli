@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 import json
+import math
 import re
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _common import (  # noqa: E402  (path set above; these scripts are not a package)
+    alias_values,
+    env_driver,
+    load_config,
+    parse_database_url,
+    sql_literal,
+)
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -12,26 +21,15 @@ DB_QUERY = SKILL_ROOT / "scripts" / "db-query"
 INIT_CONFIG = SKILL_ROOT / "scripts" / "init-config"
 SERVER_VERSION = "0.6.0"
 
-
-def config_paths(explicit_path=None):
-    if explicit_path:
-        return [Path(explicit_path).expanduser()]
-    return [
-        SKILL_ROOT / "connections.local.json",
-        Path.cwd() / "connections.local.json",
-        Path.home() / ".config" / "database-cli" / "connections.json",
-    ]
-
-
-def load_config(explicit_path=None, required=False):
-    for path in config_paths(explicit_path):
-        if path.exists():
-            with path.open("r", encoding="utf-8") as handle:
-                return json.load(handle), path
-    if required:
-        paths = ", ".join(str(path) for path in config_paths(explicit_path))
-        raise ValueError(f"No config file found. Checked: {paths}")
-    return {}, None
+# db-query applies DB_QUERY_TIMEOUT to every sq invocation it makes, and one
+# call can make several: repair --allow-write runs source-add, count, snapshot,
+# change, and post-check. The outer backstop is derived from that worst case so
+# db-query's own timeout always fires first and reports which query stalled;
+# the backstop only catches a db-query wedged before or between its sq calls.
+DB_QUERY_TIMEOUT = 60
+MAX_SQ_CALLS_PER_RUN = 5
+DB_QUERY_BACKSTOP = DB_QUERY_TIMEOUT * MAX_SQ_CALLS_PER_RUN + 30
+INIT_CONFIG_TIMEOUT = 30  # writes local config files, never touches the network
 
 
 def tool_schema(config_path=None):
@@ -168,6 +166,10 @@ def tool_schema(config_path=None):
                         "type": "boolean",
                         "description": "Allow DML after explicit user approval. DDL, transactions, procedures, locks, and exports remain blocked.",
                     },
+                    "writable": {
+                        "type": "boolean",
+                        "description": "Declare an ad-hoc (url/host) connection writable; required alongside allow_write. Configured environments declare \"writable\": true in the config file instead, and cannot be made writable from a tool call.",
+                    },
                     "print_command": {"type": "boolean"},
                 },
                 "required": ["sql"],
@@ -230,6 +232,10 @@ def tool_schema(config_path=None):
                     "allow_write": {
                         "type": "boolean",
                         "description": "Execute the change and run the post-check. Only after explicit user approval for DML.",
+                    },
+                    "writable": {
+                        "type": "boolean",
+                        "description": "Declare an ad-hoc (url/host) connection writable; required alongside allow_write. Configured environments declare \"writable\": true in the config file instead, and cannot be made writable from a tool call.",
                     },
                     "print_command": {"type": "boolean"},
                 },
@@ -348,39 +354,6 @@ def parameter_schema(param_spec):
     return schema
 
 
-def parse_database_url(raw_url):
-    if not raw_url:
-        return {}
-    if "://" not in raw_url:
-        return {"host": raw_url}
-
-    parsed = urlparse(raw_url)
-    values = {}
-    if parsed.scheme:
-        scheme = parsed.scheme.lower()
-        values["driver"] = "sqlite3" if scheme == "sqlite" else scheme
-    if parsed.hostname:
-        values["host"] = parsed.hostname
-    if parsed.port:
-        values["port"] = parsed.port
-    if parsed.username:
-        values["username"] = unquote(parsed.username)
-    if parsed.password:
-        values["password"] = unquote(parsed.password)
-
-    path = unquote(parsed.path.lstrip("/"))
-    if path:
-        if values.get("driver") in {"sqlite3", "duckdb"}:
-            values["path"] = unquote(parsed.path)
-        else:
-            values["database"] = path
-
-    params = {key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
-    if params:
-        values["params"] = params
-    return values
-
-
 def merged_connection_args(args):
     parsed = parse_database_url(args.get("url"))
     merged = dict(parsed)
@@ -424,7 +397,13 @@ def run_add_connection(args):
         if alias:
             cmd.extend(["--alias", str(alias)])
 
-    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    try:
+        proc = subprocess.run(
+            cmd, text=True, stdin=subprocess.DEVNULL, capture_output=True,
+            check=False, timeout=INIT_CONFIG_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return timeout_result("init-config", INIT_CONFIG_TIMEOUT)
     if proc.returncode == 0 and merged.get("params"):
         patch_connection_params(Path(args.get("config") or (SKILL_ROOT / "connections.local.json")), args["env"], merged["params"])
     return process_result(proc)
@@ -453,6 +432,9 @@ def add_common_args(cmd, args):
         cmd.extend(["--schema", args["schema"]])
     if args.get("no_auto_limit"):
         cmd.append("--no-auto-limit")
+    # Pin db-query's per-query timeout instead of inheriting its default, so
+    # DB_QUERY_BACKSTOP is provably the looser of the two.
+    cmd.extend(["--timeout", str(DB_QUERY_TIMEOUT)])
 
 
 def add_connection_args(cmd, args):
@@ -499,6 +481,8 @@ def command_for_tool(name, args):
         add_connection_args(cmd, args)
         if args.get("allow_write"):
             cmd.append("--allow-write")
+        if args.get("writable"):
+            cmd.append("--writable")
         if args.get("print_command"):
             cmd.append("--print-command")
         if args.get("env"):
@@ -530,6 +514,8 @@ def command_for_tool(name, args):
         add_connection_args(cmd, args)
         if args.get("allow_write"):
             cmd.append("--allow-write")
+        if args.get("writable"):
+            cmd.append("--writable")
         if args.get("print_command"):
             cmd.append("--print-command")
         if args.get("key_columns"):
@@ -567,19 +553,52 @@ def command_for_tool(name, args):
             cmd.append("--no-auto-limit")
         if args.get("allow_write"):
             cmd.append("--allow-write")
+        if args.get("writable"):
+            cmd.append("--writable")
         cmd.extend(["--check-sql", args["sql"]])
         return cmd
     raise ValueError(f"Unknown tool '{name}'.")
 
 
-def sql_literal(value):
+def configured_driver(config, env_name):
+    """Driver of a configured environment, resolving aliases the way db-query does.
+
+    Returns "" when it cannot be determined; sql_literal then refuses exactly
+    the values whose quoting depends on knowing it.
+    """
+    envs = config.get("environments", {})
+    if not isinstance(envs, dict):
+        return ""
+    env = envs.get(env_name)
+    if not isinstance(env, dict):
+        matches = [
+            candidate
+            for candidate in envs.values()
+            if isinstance(candidate, dict) and env_name in alias_values(candidate)
+        ]
+        if len(matches) != 1:
+            return ""
+        env = matches[0]
+    return env_driver(env)
+
+
+def sql_param_literal(value, driver):
+    """Render a validated custom-tool parameter as a SQL literal.
+
+    validate_custom_arg has already coerced the value, so the type domain here
+    is narrower than a snapshot row's. The quoting itself is shared: it has to
+    agree with db-query or the two entry points would emit different SQL for
+    the same value.
+    """
     if value is None:
         return "NULL"
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"Parameter value {value!r} has no SQL literal form.")
         return str(value)
-    return "'" + str(value).replace("'", "''") + "'"
+    return sql_literal(value, driver)
 
 
 def validate_custom_arg(name, spec, value):
@@ -616,7 +635,7 @@ def validate_custom_arg(name, spec, value):
     return converted
 
 
-def render_custom_sql(spec, args):
+def render_custom_sql(spec, args, driver):
     sql = spec.get("sql")
     if not sql:
         raise ValueError("Configured tool is missing sql.")
@@ -640,7 +659,7 @@ def render_custom_sql(spec, args):
         name = match.group(1)
         if name not in values:
             raise ValueError(f"SQL references unknown parameter '{name}'.")
-        return sql_literal(values[name])
+        return sql_param_literal(values[name], driver)
 
     return re.sub(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", replace, sql)
 
@@ -654,7 +673,7 @@ def command_for_custom_tool(name, args):
     env = spec.get("env") or args.get("env")
     if not env:
         raise ValueError(f"Configured tool '{name}' must define env.")
-    sql = render_custom_sql(spec, args)
+    sql = render_custom_sql(spec, args, configured_driver(config, env))
     cmd = [str(DB_QUERY)]
     if args.get("config"):
         cmd.extend(["--config", args["config"]])
@@ -666,6 +685,7 @@ def command_for_custom_tool(name, args):
         cmd.extend(["--schema", spec["schema"]])
     if args.get("_print_command"):
         cmd.append("--print-command")
+    cmd.extend(["--timeout", str(DB_QUERY_TIMEOUT)])
     cmd.extend(["--env", env, "--sql", sql])
     return cmd
 
@@ -677,8 +697,30 @@ def run_tool(name, args):
         cmd = command_for_tool(name, args)
     except ValueError:
         cmd = command_for_custom_tool(name, args)
-    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    try:
+        proc = subprocess.run(
+            # Never let a child inherit the JSON-RPC pipe: it would block on, or
+            # consume, the bytes the client is still sending us.
+            cmd, text=True, stdin=subprocess.DEVNULL, capture_output=True,
+            check=False, timeout=DB_QUERY_BACKSTOP,
+        )
+    except subprocess.TimeoutExpired:
+        return timeout_result("db-query", DB_QUERY_BACKSTOP)
     return process_result(proc)
+
+
+def timeout_result(what, timeout):
+    """Report a timeout as a failed tool call.
+
+    Never build this from the TimeoutExpired, which stringifies the whole
+    command line: that can carry --password.
+    """
+    message = f"{what} exceeded {timeout}s and was terminated."
+    return {
+        "content": [{"type": "text", "text": message}],
+        "structuredContent": {"exit_code": 124, "stdout": "", "stderr": message},
+        "isError": True,
+    }
 
 
 def process_result(proc):
@@ -707,6 +749,13 @@ def error_response(message, code=-32603):
 
 
 def handle(message):
+    if not isinstance(message, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Request must be a JSON object."},
+        }
+
     method = message.get("method")
     response = {"jsonrpc": "2.0"}
     if "id" in message:
@@ -734,36 +783,46 @@ def handle(message):
         response["error"] = {"code": -32602, "message": f"Missing required field: {exc}"}
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         response["error"] = {"code": -32603, "message": str(exc)}
+    except Exception as exc:  # one bad call must not take down a long-lived server
+        response["error"] = {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}
     return response
 
 
-def parse_content_length_frames(data):
-    messages = []
-    offset = 0
-    while offset < len(data):
-        header_end = data.find(b"\r\n\r\n", offset)
-        if header_end == -1:
-            break
-        headers = data[offset:header_end].decode("ascii", errors="replace").split("\r\n")
-        length = None
-        for header in headers:
-            name, _, value = header.partition(":")
-            if name.lower() == "content-length":
-                length = int(value.strip())
-        if length is None:
-            break
-        start = header_end + 4
-        end = start + length
-        messages.append(json.loads(data[start:end].decode("utf-8")))
-        offset = end
-    return messages
+def read_message(stream):
+    """Read one JSON-RPC message from a live stdio stream.
 
+    Blocks only until the current message is complete, so each response goes
+    out while the client keeps the pipe open. Framing is detected per message:
+    a Content-Length header introduces a framed body, any other non-blank line
+    is one NDJSON message. Returns (raw_body, framed), or (None, framed) at EOF.
+    """
+    while True:
+        line = stream.readline()
+        if not line:
+            return None, False
+        stripped = line.strip()
+        if not stripped:
+            continue
 
-def read_messages(data):
-    if data.lstrip().startswith(b"Content-Length:"):
-        return parse_content_length_frames(data), True
-    messages = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
-    return messages, False
+        if not stripped.lower().startswith(b"content-length:"):
+            return stripped, False
+
+        try:
+            length = int(stripped.partition(b":")[2].strip())
+        except ValueError as exc:
+            raise ValueError(f"invalid Content-Length header: {stripped!r}") from exc
+        if length < 0:
+            raise ValueError(f"negative Content-Length: {length}")
+
+        while True:  # drop the remaining headers up to the blank separator line
+            header = stream.readline()
+            if not header or not header.strip():
+                break
+
+        body = stream.read(length)
+        if body is None or len(body) < length:
+            return None, True
+        return body, True
 
 
 def write_response(response, framed):
@@ -772,23 +831,37 @@ def write_response(response, framed):
         sys.stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii"))
         sys.stdout.buffer.write(raw)
     else:
-        sys.stdout.write(raw.decode("utf-8") + "\n")
-    sys.stdout.flush()
+        sys.stdout.buffer.write(raw + b"\n")
+    sys.stdout.buffer.flush()
 
 
-def main():
-    data = sys.stdin.buffer.read()
-    if not data:
-        return 0
-    try:
-        messages, framed = read_messages(data)
-    except (ValueError, json.JSONDecodeError) as exc:
-        write_response(error_response(f"Invalid JSON-RPC input: {exc}", -32700), False)
-        return 0
-    for message in messages:
+def serve(stream):
+    """Serve JSON-RPC messages until the client closes the stream."""
+    framed = False
+    while True:
+        try:
+            raw, framed = read_message(stream)
+        except ValueError as exc:
+            # Framing is desynchronized; the rest of the stream is unusable.
+            write_response(error_response(f"Invalid JSON-RPC framing: {exc}", -32700), framed)
+            return
+        if raw is None:
+            return
+        try:
+            message = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            write_response(error_response(f"Invalid JSON-RPC input: {exc}", -32700), framed)
+            continue
         response = handle(message)
         if response is not None and "id" in response:
             write_response(response, framed)
+
+
+def main():
+    try:
+        serve(sys.stdin.buffer)
+    except BrokenPipeError:
+        pass  # the client went away mid-response
     return 0
 
 
