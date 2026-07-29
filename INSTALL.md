@@ -136,6 +136,8 @@ scripts/db-query --list-envs
 - 需要 Agent 结构化工具入口时，使用 `scripts/database-mcp`；它只是适配层，仍然委托 `scripts/db-query` 执行实际查询。
 - 运行中的 Agent 需要新增连接时，优先调用 MCP `add_connection` 工具；调用成功后无需重启 Agent，后续可先调用 `setup_status` 确认配置已可见。
 - 默认不执行写 SQL。
-- 用户明确允许修改时，才能使用 `--allow-write` 或 MCP `allow_write=true` 执行单条 `INSERT`、`UPDATE`、`DELETE`、`REPLACE`。
+- 写权限先由配置声明：环境须写明 `"writable": true`，临时连接须传 `--writable`。未声明时 `--allow-write` 会被拒绝。
+- 在此基础上，用户明确允许修改时，才能使用 `--allow-write` 或 MCP `allow_write=true` 执行单条 `INSERT`、`UPDATE`、`DELETE`、`REPLACE`。
+- 已批准的 `UPDATE`/`DELETE` 执行前会先 COUNT 真实影响行数，超过 `max_write_rows`（默认 1000）拒绝。
 - 未获得用户明确允许时，修数只输出给人工执行的 SQL。
 - 不展示或提交明文密码。

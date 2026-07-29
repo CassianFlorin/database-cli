@@ -82,12 +82,19 @@ jobs:
             git commit -m "chore(release): 同步版本号到 ${{ steps.tag.outputs.new_tag }} [skip ci]"
           fi
 
+      # 顺序即回滚策略：tag 先只建在本地，main 推成功后才推 tag、再建 Release。
+      # 因此推 main 失败时，尚未发布任何东西，修好原因重跑即可。
       - name: Tag and push
         if: steps.tag.outputs.new_tag != ''
         run: |
           set -euo pipefail
           git tag -a "${{ steps.tag.outputs.new_tag }}" -m "${{ steps.tag.outputs.new_tag }}"
-          git push origin HEAD:main
+          if ! git push origin HEAD:main; then
+            echo "::error::推送 main 失败，尚未创建远端 tag 或 Release，可安全重跑。"
+            echo "::error::常见原因：分支保护禁止 github-actions[bot] 推送（需为其放行，"
+            echo "::error::或把版本回写改为开 PR）；或本次运行期间 main 已被他人推进。"
+            exit 1
+          fi
           git push origin "${{ steps.tag.outputs.new_tag }}"
 
       - name: Create GitHub Release

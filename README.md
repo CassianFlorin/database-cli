@@ -509,13 +509,23 @@ DATABASE_CLI_CONFIG=/path/to/connections.json scripts/db-query --list-envs
 scripts/db-query --check-sql "SELECT * FROM qnvip_center_commerce.cc_order WHERE order_no = 'YP...'"
 ```
 
-用户明确允许修改后，才可以显式开启 DML：
+用户明确允许修改后，才可以显式开启 DML。前提是该环境已在配置中声明
+`"writable": true`，否则 `--allow-write` 会被拒绝：
 
 ```bash
 scripts/db-query \
   --env qa01 \
   --allow-write \
   --sql "UPDATE qnvip_center_commerce.cc_order SET status = 1 WHERE id = 10"
+```
+
+临时连接（`--url`/`--host`）没有配置项可承载这个声明，需要额外传 `--writable`：
+
+```bash
+scripts/db-query \
+  --url "mysql://mysql-qa01.example.internal" --username repair_user \
+  --writable --allow-write \
+  --sql "UPDATE cc_order SET status = 1 WHERE id = 10"
 ```
 
 ## 安全规则
@@ -529,7 +539,7 @@ scripts/db-query \
 - `EXPLAIN`
 - 只读的 `WITH ... SELECT`
 
-用户明确允许并传入 `--allow-write` 后，额外允许：
+环境声明 `"writable": true`、用户明确允许并传入 `--allow-write` 后，额外允许：
 
 - `INSERT`
 - `UPDATE`
@@ -539,6 +549,9 @@ scripts/db-query \
 会被拦截的示例：
 
 - 未传 `--allow-write` 的 `INSERT`、`UPDATE`、`DELETE`、`REPLACE`
+- 环境未声明 `"writable": true` 时的一切 DML，即使传了 `--allow-write`
+- 实际影响行数超过 `max_write_rows` 的 `UPDATE`/`DELETE`
+- 对 DML 的 `EXPLAIN ANALYZE`（MySQL 8.0.18+ 会真的执行）
 - `MERGE`
 - `CREATE`、`ALTER`、`DROP`、`TRUNCATE`
 - `GRANT`、`REVOKE`
@@ -550,7 +563,7 @@ scripts/db-query \
 
 `SELECT` 和 `WITH` 查询会自动补 `LIMIT 200`，除非 SQL 已经包含 limit，或显式使用 `--no-auto-limit`。DML 不会自动补 limit；Agent 必须使用精确业务键和可审计的 `WHERE` 条件。
 
-配置了 `max_rows` 时，它是硬上限；用户传入更大的 `--limit` 或 SQL 里已有更大的 `LIMIT`，都会被压到 `max_rows`。`readonly=false` 不会启用写 SQL，database-cli 会直接拒绝该配置。写 SQL 只能通过单次命令的 `--allow-write` 显式开启。
+配置了 `max_rows` 时，它是硬上限；用户传入更大的 `--limit` 或 SQL 里已有更大的 `LIMIT`，都会被压到 `max_rows`。`readonly=false` 不会启用写 SQL，database-cli 会直接拒绝该配置；`readonly=true` 也不授予任何权限，它只是默认姿态。写 SQL 需要两个条件同时成立：环境在配置里声明 `"writable": true`（临时连接则传 `--writable`），以及单次命令显式传 `--allow-write`。前者刻意放在配置文件里，使拼命令的一方无法自行主张写权限。
 
 ## 密码处理
 
@@ -608,6 +621,7 @@ export QA01_DB_PASSWORD='...'
 
 如果用户明确要求并允许 Agent 直接执行修数 SQL，必须满足：
 
+- 目标环境已在配置声明 `"writable": true`（临时连接另需 `--writable`）
 - 使用 `--allow-write` 或 MCP `allow_write=true`
 - 只执行单条 `INSERT`、`UPDATE`、`DELETE` 或 `REPLACE`
 - 先给出执行前 `SELECT` 校验
@@ -620,12 +634,15 @@ export QA01_DB_PASSWORD='...'
 
 ```bash
 python3 -m py_compile \
+  skills/database-cli/scripts/_common.py \
   skills/database-cli/scripts/db-query \
   skills/database-cli/scripts/init-config \
   skills/database-cli/scripts/install \
   skills/database-cli/scripts/database-mcp
 python3 -m unittest discover -s tests
 ```
+
+`tests/test_integration.py` 会用真实的 `sq` 与临时 SQLite 文件跑端到端流程；本地没有 `sq` 时这部分会自动跳过，其余测试照常运行。CI 会安装 `sq` 并设置 `DATABASE_CLI_REQUIRE_SQ=1`，使安装失败导致构建失败，而不是静默跳过。
 
 当环境里有 `PyYAML` 时，执行 Skill 校验：
 
