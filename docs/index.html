@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>database-cli — 面向 Agent 的数据库排查 Skill</title>
+<meta name="description" content="CLI 优先的数据库排查 Skill：默认只读，写权限由配置声明，修数产出可审计的证据链。支持 MySQL、Postgres、SQLite、DuckDB、SQL Server、ClickHouse。">
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-soft: #f6f8fa;
+    --bg-code: #f6f8fa;
+    --fg: #1f2328;
+    --fg-muted: #59636e;
+    --border: #d1d9e0;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --danger: #cf222e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --bg-soft: #151b23;
+      --bg-code: #151b23;
+      --fg: #e6edf3;
+      --fg-muted: #9198a1;
+      --border: #3d444d;
+      --accent: #6ea8fe;
+      --accent-soft: #10243e;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --danger: #f85149;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    font-family: var(--mono);
+    font-size: 0.875em;
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.12em 0.36em;
+  }
+  pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    margin: 0 0 16px;
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: 0.8125rem; line-height: 1.6; }
+  .c { color: var(--fg-muted); }
+
+  header {
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, var(--bg-soft), var(--bg));
+    padding: 56px 0 44px;
+  }
+  h1 { font-size: 2.1rem; margin: 0 0 6px; letter-spacing: -0.02em; }
+  .tagline { font-size: 1.12rem; color: var(--fg-muted); margin: 0 0 22px; max-width: 60ch; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 24px; }
+  .badge {
+    font-family: var(--mono); font-size: 0.75rem;
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 11px; color: var(--fg-muted); background: var(--bg);
+  }
+  .badge.v { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .cta { display: flex; flex-wrap: wrap; gap: 10px; }
+  .btn {
+    display: inline-block; padding: 8px 16px; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--bg); font-size: 0.9375rem;
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { text-decoration: none; filter: brightness(1.08); }
+
+  section { padding: 44px 0; border-bottom: 1px solid var(--border); }
+  section:last-of-type { border-bottom: 0; }
+  h2 { font-size: 1.4rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 + .lede { color: var(--fg-muted); margin: 0 0 24px; max-width: 66ch; }
+  h3 { font-size: 1rem; margin: 26px 0 8px; }
+  p { margin: 0 0 14px; }
+
+  .layers { display: grid; gap: 12px; margin: 0 0 8px; }
+  .layer {
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 14px 16px; background: var(--bg-soft);
+  }
+  .layer h3 { margin: 0 0 4px; font-size: 0.9375rem; }
+  .layer p { margin: 0; color: var(--fg-muted); font-size: 0.9375rem; }
+  .layer code { background: var(--bg); }
+
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 6px; font-size: 0.9375rem; }
+  .card p { margin: 0; font-size: 0.9rem; color: var(--fg-muted); }
+
+  .steps { counter-reset: s; list-style: none; padding: 0; margin: 0; }
+  .steps > li { counter-increment: s; position: relative; padding-left: 34px; margin-bottom: 22px; }
+  .steps > li::before {
+    content: counter(s); position: absolute; left: 0; top: 1px;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent);
+    font-family: var(--mono); font-size: 0.75rem;
+    display: grid; place-items: center; font-weight: 600;
+  }
+  .steps h3 { margin: 0 0 8px; font-size: 0.9375rem; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 0.8125rem; color: var(--fg-muted); font-weight: 600; }
+  td code { white-space: nowrap; }
+  .scroll { overflow-x: auto; }
+
+  .note {
+    border: 1px solid var(--border); border-left: 3px solid var(--warn);
+    border-radius: 8px; padding: 13px 16px; background: var(--bg-soft);
+    font-size: 0.9375rem; color: var(--fg-muted); margin: 0 0 16px;
+  }
+  .note strong { color: var(--fg); }
+  .tokens { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; }
+  .tok {
+    font-family: var(--mono); font-size: 0.75rem; padding: 3px 9px;
+    border-radius: 5px; border: 1px solid var(--border);
+  }
+  .tok.read { color: var(--ok); border-color: var(--ok); }
+  .tok.write { color: var(--warn); border-color: var(--warn); }
+  .tok.no { color: var(--danger); border-color: var(--danger); }
+
+  footer { padding: 34px 0 56px; color: var(--fg-muted); font-size: 0.875rem; }
+  footer a { color: var(--fg-muted); text-decoration: underline; }
+  ul.tight { margin: 0 0 14px; padding-left: 22px; }
+  ul.tight li { margin-bottom: 5px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>database-cli</h1>
+    <p class="tagline">面向 Agent 的数据库排查 Skill。默认只读，写权限由配置声明而非命令行主张，修数产出可人工复核的证据链。</p>
+    <div class="badges">
+      <span class="badge v">v1.0.1</span>
+      <span class="badge">MIT</span>
+      <span class="badge">Python 3.10+</span>
+      <span class="badge">Codex / Claude Code</span>
+    </div>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/CassianFlorin/database-cli">GitHub 仓库</a>
+      <a class="btn" href="https://github.com/CassianFlorin/database-cli/blob/main/INSTALL.md">安装指南</a>
+      <a class="btn" href="https://github.com/CassianFlorin/database-cli/releases">Releases</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>它解决什么问题</h2>
+    <p class="lede">让 Agent 能查数据库，同时不必把生产库的写权限交到一次提示词的判断上。</p>
+    <p>Agent 排查线上问题时需要读数据库：找表、看字段、按业务键查记录、对比环境。这部分本该是低风险的，但一旦同一个入口也能写，风险就不再由「这次查询对不对」决定，而由「护栏是否真的存在」决定。</p>
+    <p><code>database-cli</code> 把执行收在一个入口上：<code>scripts/db-query</code> 是唯一真实执行路径，负责 SQL 安全检查、结果集上限、连接管理和审计。MCP 只是它之上的一层可选适配器，不是第二个查询引擎。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>安全模型</h2>
+    <p class="lede">写入需要四个条件同时成立，其中最关键的一个刻意放在配置文件里——拼命令的一方无法自行主张写权限。</p>
+
+    <div class="layers">
+      <div class="layer">
+        <h3>1 · 默认只读</h3>
+        <p>只放行无副作用的起始关键字。DDL、权限、事务、存储过程、锁、导出，以及带副作用的函数一律拦截。</p>
+      </div>
+      <div class="layer">
+        <h3>2 · 环境须在配置声明可写</h3>
+        <p>环境必须写明 <code>"writable": true</code> 才接受 <code>--allow-write</code>。这个声明存在配置文件里，Agent 无法通过构造命令绕过；临时连接没有配置项承载它，需要另传 <code>--writable</code>，因此也无法把受保护的库改写成临时连接来规避。</p>
+      </div>
+      <div class="layer">
+        <h3>3 · 单次调用显式开关</h3>
+        <p>在上一条成立的前提下，仍需为每次写入显式传入 <code>--allow-write</code>。<code>UPDATE</code>/<code>DELETE</code> 必须带 <code>WHERE</code>。</p>
+      </div>
+      <div class="layer">
+        <h3>4 · 影响面硬上限</h3>
+        <p>执行前先在服务端 <code>COUNT</code> 真实影响行数，超过 <code>max_write_rows</code>（默认 1000）直接拒绝。<code>WHERE 1=1</code> 这类看似有 <code>WHERE</code>、实则全表的语句不会放行。</p>
+      </div>
+    </div>
+
+    <h3>默认放行</h3>
+    <div class="tokens">
+      <span class="tok read">SELECT</span><span class="tok read">SHOW</span><span class="tok read">DESC</span>
+      <span class="tok read">DESCRIBE</span><span class="tok read">EXPLAIN</span><span class="tok read">WITH … SELECT</span>
+    </div>
+
+    <h3>满足全部条件后额外放行</h3>
+    <div class="tokens">
+      <span class="tok write">INSERT</span><span class="tok write">UPDATE</span>
+      <span class="tok write">DELETE</span><span class="tok write">REPLACE</span>
+    </div>
+
+    <h3>始终拦截</h3>
+    <div class="tokens">
+      <span class="tok no">CREATE / ALTER / DROP / TRUNCATE</span>
+      <span class="tok no">GRANT / REVOKE</span>
+      <span class="tok no">BEGIN / COMMIT / ROLLBACK</span>
+      <span class="tok no">CALL / EXEC</span>
+      <span class="tok no">LOCK / UNLOCK</span>
+      <span class="tok no">SELECT … FOR UPDATE</span>
+      <span class="tok no">EXPLAIN ANALYZE + DML</span>
+      <span class="tok no">多语句</span>
+    </div>
+    <div class="note">
+      <strong>为什么 <code>EXPLAIN ANALYZE</code> 对 DML 也拦：</strong>
+      MySQL 8.0.18+ 会真的执行被分析的语句，而首关键字是 <code>EXPLAIN</code> 会让它绕过所有按起始 token 生效的检查——<code>WHERE</code> 强制要求、影响面上限、以及审计的读写判定。
+    </div>
+    <p>结果集也有上限：<code>SELECT</code>/<code>WITH</code> 自动补 <code>LIMIT 200</code>，配置的 <code>max_rows</code> 是硬上限，更大的 <code>--limit</code> 或 SQL 里已有的更大 <code>LIMIT</code> 都会被压回去。每次真正访问数据库的调用都会写一行本地审计日志（<code>0600</code>，含语句、环境、读写模式、影响行数、耗时）。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>快速开始</h2>
+    <p class="lede">依赖一个外部工具：<a href="https://sq.io">sq</a>，负责实际的数据库连接与输出格式化。</p>
+    <ol class="steps">
+      <li>
+        <h3>安装</h3>
+<pre><code>brew install sq
+git clone https://github.com/CassianFlorin/database-cli.git
+cd database-cli</code></pre>
+      </li>
+      <li>
+        <h3>检查环境就绪状态</h3>
+        <p>只读本地配置与 <code>sq</code> 可用性，不连数据库：</p>
+<pre><code>scripts/db-query --setup-status</code></pre>
+      </li>
+      <li>
+        <h3>添加一个只读连接</h3>
+        <p>凭据写入被 gitignore 的本地配置；生产环境建议用 <code>--password-env</code> 而非明文：</p>
+<pre><code>scripts/install \
+  --env qa01 \
+  --url "mysql://db-qa01.example.internal:3306/orders" \
+  --username readonly_user \
+  --password-env QA01_DB_PASSWORD \
+  --non-interactive</code></pre>
+      </li>
+      <li>
+        <h3>先查元数据，再查数据</h3>
+<pre><code><span class="c"># 跨可见 schema 搜索字段名</span>
+scripts/db-query --env qa01 --search-objects "%order_no%" \
+  --object-type column
+
+<span class="c"># 按业务键取记录</span>
+scripts/db-query --env qa01 \
+  --sql "SELECT id, order_no, status FROM orders.cc_order WHERE order_no = 'A1001'"</code></pre>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>修数工作流</h2>
+    <p class="lede">默认不执行，而是产出一份人工可审的修复包：前置检查、变更、回滚、后置检查。</p>
+
+    <h3>1 · 先看影响面</h3>
+    <p>不需要任何写权限。返回真实影响行数与匹配行的写前快照——行数与预期不符时应当停下，而不是当作细节。</p>
+<pre><code>scripts/db-query --env qa01 \
+  --preview-write "UPDATE cc_order SET status = 1 WHERE order_no = 'A1001'"</code></pre>
+
+    <h3>2 · 从写前镜像生成回滚 SQL</h3>
+    <p>只生成、不执行。<code>UPDATE</code> 还原旧值，<code>DELETE</code> 重新插回被删的行。字符串字面量按目标 driver 转义——MySQL 系把反斜杠当转义符、标准 SQL 不当，同一套规则无法同时正确，因此 driver 未知时宁可拒绝也不产出可能错位的语句。匹配行超出快照上限时拒绝生成残缺回滚。</p>
+<pre><code>scripts/db-query --env qa01 --key-columns id \
+  --generate-rollback "UPDATE cc_order SET status = 1 WHERE order_no = 'A1001'"</code></pre>
+
+    <h3>3 · 一条命令产出完整修复包</h3>
+    <p>默认只读，输出 <code>executed: false</code> 的完整包供人工执行。加 <code>--allow-write</code>（且环境已声明可写）才按前置检查 → 变更 → 后置检查的顺序执行，并给出含实际结果的证据链。回滚镜像在写入前一刻捕获，与实际变更保持一致。</p>
+<pre><code>scripts/db-query --env qa01 --key-columns id \
+  --repair "UPDATE cc_order SET status = 1 WHERE order_no = 'A1001'"</code></pre>
+    <div class="note">
+      修复包不是事务原子的。它把「先验证影响面、留好回滚、执行、再验证」这套人工流程固化成一条命令，而不是替代事务。
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>MCP 适配层</h2>
+    <p class="lede">给需要结构化工具调用的客户端准备的可选入口，全部委托给同一个 CLI，因此安全边界完全一致。</p>
+    <div class="grid">
+      <div class="card"><h3>setup_status</h3><p>就绪状态、缺失前置条件与下一步动作，不连数据库。</p></div>
+      <div class="card"><h3>list_envs / add_connection</h3><p>列出连接；运行中新增连接无需重启客户端。</p></div>
+      <div class="card"><h3>search_objects / inspect</h3><p>搜索 schema、表、字段、索引、存储过程；查看结构。</p></div>
+      <div class="card"><h3>query_readonly / execute_sql</h3><p>只读查询；后者可在获得授权后执行 DML。</p></div>
+      <div class="card"><h3>preview_write / generate_rollback</h3><p>影响面预览与回滚生成，均不需要写权限。</p></div>
+      <div class="card"><h3>repair / check_sql</h3><p>完整修复包；以及不执行的 SQL 安全校验。</p></div>
+    </div>
+    <p style="margin-top:16px">适配层刻意保持很薄：它不实现查询逻辑，也不暴露 CLI 没有的能力。<code>add_connection</code> 有意不支持声明写权限——否则运行中的 Agent 就能给自己开写权限，配置侧的声明也就失去了意义。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>支持的数据库</h2>
+    <p class="lede">通过 <code>sq</code> 连接。也可以直接复用已有的 <code>sq</code> source handle。</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>数据库</th><th>driver</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>MySQL / MariaDB</td><td><code>mysql</code> <code>mariadb</code></td><td>元数据搜索走 <code>INFORMATION_SCHEMA</code></td></tr>
+          <tr><td>PostgreSQL</td><td><code>postgres</code> <code>postgresql</code></td><td>元数据搜索走 <code>information_schema</code> 与 <code>pg_catalog</code></td></tr>
+          <tr><td>SQLite</td><td><code>sqlite3</code></td><td>文件路径连接，端到端测试即用它</td></tr>
+          <tr><td>DuckDB</td><td><code>duckdb</code></td><td>文件路径连接</td></tr>
+          <tr><td>SQL Server</td><td><code>sqlserver</code></td><td>元数据搜索请用 <code>--inspect</code></td></tr>
+          <tr><td>ClickHouse</td><td><code>clickhouse</code></td><td>字面量转义按反斜杠转义方言处理</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>延伸阅读</h2>
+    <ul class="tight">
+      <li><a href="https://github.com/CassianFlorin/database-cli/blob/main/README.md">README</a> — 完整命令参考、安全规则与密码处理</li>
+      <li><a href="https://github.com/CassianFlorin/database-cli/blob/main/INSTALL.md">INSTALL</a> — 安装与首次配置流程</li>
+      <li><a href="https://github.com/CassianFlorin/database-cli/blob/main/skills/database-cli/references/config.md">配置参考</a> — 全部配置字段，含 <code>writable</code> 与 <code>max_write_rows</code></li>
+      <li><a href="https://github.com/CassianFlorin/database-cli/blob/main/skills/database-cli/SKILL.md">SKILL.md</a> — Agent 实际读取的指令与硬性规则</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>MIT License · <a href="https://github.com/CassianFlorin/database-cli">CassianFlorin/database-cli</a></p>
+    <p>本页示例中的主机名、库名与业务键均为占位值，不指向任何真实环境。</p>
+  </div>
+</footer>
+
+</body>
+</html>

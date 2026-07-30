@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_MANIFEST = ROOT / ".codex-plugin" / "plugin.json"
 MCP_SERVER = ROOT / "skills" / "database-cli" / "scripts" / "database-mcp"
+LANDING_PAGE = ROOT / "docs" / "index.html"
 
 
 def load_setter():
@@ -32,16 +33,22 @@ def load_setter():
     return module
 
 
+def declared_page_version(path=LANDING_PAGE):
+    match = re.search(r'<span class="badge v">v([^<]*)</span>', path.read_text(encoding="utf-8"))
+    return match.group(1) if match else None
+
+
 def declared_server_version(path=MCP_SERVER):
     match = re.search(r'^SERVER_VERSION = "([^"]*)"$', path.read_text(encoding="utf-8"), re.M)
     return match.group(1) if match else None
 
 
 class VersionConsistencyTest(unittest.TestCase):
-    def test_manifest_and_mcp_server_declare_the_same_version(self):
+    def test_every_declared_version_agrees(self):
         manifest = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))["version"]
 
         self.assertEqual(manifest, declared_server_version())
+        self.assertEqual(manifest, declared_page_version(), "landing page badge is stale")
 
     def test_declared_version_looks_like_a_release(self):
         manifest = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))["version"]
@@ -55,7 +62,7 @@ class SetVersionTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        for source in (PLUGIN_MANIFEST, MCP_SERVER):
+        for source in (PLUGIN_MANIFEST, MCP_SERVER, LANDING_PAGE):
             target = self.root / source.relative_to(ROOT)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
@@ -66,11 +73,20 @@ class SetVersionTest(unittest.TestCase):
     def server(self):
         return self.root / "skills" / "database-cli" / "scripts" / "database-mcp"
 
-    def test_writes_the_version_into_both_files(self):
+    def page(self):
+        return self.root / "docs" / "index.html"
+
+    def test_writes_the_version_into_every_file(self):
         self.mod.set_version(self.root, "1.2.3")
 
         self.assertEqual(json.loads(self.manifest().read_text(encoding="utf-8"))["version"], "1.2.3")
         self.assertEqual(declared_server_version(self.server()), "1.2.3")
+        self.assertEqual(declared_page_version(self.page()), "1.2.3")
+
+    def test_page_badge_keeps_its_v_prefix_and_markup(self):
+        self.mod.set_version(self.root, "2.0.0")
+
+        self.assertIn('<span class="badge v">v2.0.0</span>', self.page().read_text(encoding="utf-8"))
 
     def test_manifest_stays_valid_json_and_keeps_its_other_fields(self):
         before = json.loads(self.manifest().read_text(encoding="utf-8"))
@@ -95,10 +111,10 @@ class SetVersionTest(unittest.TestCase):
 
     def test_applying_the_same_version_twice_is_a_no_op(self):
         self.mod.set_version(self.root, "1.2.3")
-        first = self.manifest().read_bytes(), self.server().read_bytes()
+        first = tuple(p.read_bytes() for p in (self.manifest(), self.server(), self.page()))
         self.mod.set_version(self.root, "1.2.3")
 
-        self.assertEqual((self.manifest().read_bytes(), self.server().read_bytes()), first)
+        self.assertEqual(tuple(p.read_bytes() for p in (self.manifest(), self.server(), self.page())), first)
 
     def test_rejects_a_version_that_is_not_semver(self):
         for bad in ("v1.2.3", "1.2", "1.2.3-rc1", ""):

@@ -23,6 +23,7 @@ VERSION_PATTERN = re.compile(r"\A\d+\.\d+\.\d+\Z")
 
 PLUGIN_VERSION_FIELD = re.compile(r'("version"\s*:\s*)"[^"]*"')
 SERVER_VERSION_ASSIGNMENT = re.compile(r'^SERVER_VERSION = "[^"]*"$', re.M)
+PAGE_VERSION_BADGE = re.compile(r'(<span class="badge v">v)[^<]*(</span>)')
 
 
 def replace_once(path, pattern, replacement):
@@ -53,10 +54,22 @@ def set_server_version(root, version):
     return path
 
 
+def set_page_version(root, version):
+    """The landing page shows a version badge; keep it off the stale list too."""
+    path = root / "docs" / "index.html"
+    _, updated = replace_once(path, PAGE_VERSION_BADGE, rf"\g<1>{version}\g<2>")
+    path.write_text(updated, encoding="utf-8")
+    return path
+
+
 def set_version(root, version):
     if not VERSION_PATTERN.match(version):
         raise SystemExit(f"not a major.minor.patch version: {version!r}")
-    return [set_plugin_version(root, version), set_server_version(root, version)]
+    return [
+        set_plugin_version(root, version),
+        set_server_version(root, version),
+        set_page_version(root, version),
+    ]
 
 
 def main(argv=None):
