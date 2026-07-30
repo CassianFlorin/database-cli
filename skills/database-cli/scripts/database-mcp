@@ -19,7 +19,7 @@ from _common import (  # noqa: E402  (path set above; these scripts are not a pa
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 DB_QUERY = SKILL_ROOT / "scripts" / "db-query"
 INIT_CONFIG = SKILL_ROOT / "scripts" / "init-config"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.1.1"
 
 # db-query applies DB_QUERY_TIMEOUT to every sq invocation it makes, and one
 # call can make several: repair --allow-write runs source-add, count, snapshot,
