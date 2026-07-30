@@ -1,5 +1,7 @@
 # Database CLI Plugin
 
+📖 项目主页：**<https://cassianflorin.github.io/database-cli/>** — 安全模型概览、护栏演示与快速上手
+
 这是一个 CLI-first 的 Codex Plugin，内置 `database-cli` Skill。它面向数据库问题排查：查看表结构、搜索 schema/table/column/index/procedure、执行有范围的 SQL、跨环境核对记录，以及在需要修数时产出或执行用户明确允许的变更 SQL。
 
 底层使用 [`sq`](https://sq.io/) 作为数据库 CLI 后端，并通过本项目的 wrapper 做安全限制。`scripts/db-query` 是唯一真实执行入口；`scripts/database-mcp` 是可选的薄适配层，只把同一套 CLI 能力暴露给支持 MCP 的客户端。
