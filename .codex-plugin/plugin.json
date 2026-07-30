@@ -1,6 +1,6 @@
 {
   "name": "database-cli",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "CLI-first database investigation Skill with read-only defaults and explicit write opt-in.",
   "author": {
     "name": "Cassian Florin",
