@@ -1,12 +1,20 @@
 name: Release
 
-# 主分支每次更新后：跑测试 -> 按 Conventional Commits 计算版本 -> 打 tag + 发布 Release
+# 只有 release / hotfix 分支发版，main 不再自动发版。
+# 流程：跑测试 -> 按 Conventional Commits 计算版本 -> 回写版本号 -> 打 tag
+#       -> 发布 Release -> 把版本号同步回 main。
+#
+# 分支名同时接受不带后缀（release、hotfix）与 GitFlow 式带后缀
+# （release/1.2.0、hotfix/1.1.2）两种写法。
 on:
   push:
     branches:
-      - main
+      - release
+      - release/**
+      - hotfix
+      - hotfix/**
 
-# 串行执行，避免多次 push 并发打出冲突的 tag
+# 串行执行，避免并发打出冲突的 tag
 concurrency:
   group: release
   cancel-in-progress: false
@@ -39,7 +47,6 @@ jobs:
     name: Tag & Release
     needs: test
     runs-on: ubuntu-latest
-    # 跳过机器人/合并产生的空提交场景可在此扩展条件
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,10 +60,9 @@ jobs:
 
       # dry_run：只算版本、先不打 tag。版本号要先写进文件、提交，tag 才能落在
       # 带有正确版本号的那个提交上；否则 tag 指向的永远是上一个版本的内容。
+      #
       # v6.2（2024-03）仍是该 action 的最新发布，运行时停留在 Node 20，因此
       # 这里会保留一条 Node 20 弃用告警——不是漏升，是上游没有更新的版本。
-      # 目前仍可用（GitHub 把 Node 20 的 action 强制跑在 Node 24 上）。若哪天
-      # 真正停止支持，需要换用其他 action 或自行实现版本推算。
       - name: Determine next version
         id: tag
         uses: mathieudutour/github-tag-action@v6.2
@@ -64,14 +70,21 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           # 沿用现有 vX.Y.Z 命名
           tag_prefix: v
-          # 非 feat/fix 提交（如 docs/chore）默认按 patch 递增，
-          # 保证主分支每次更新都会产出新版本；如只想在 feat/fix 时发版，
-          # 改为 default_bump: false
-          default_bump: patch
-          release_branches: main
+          # false：只有 feat / fix / BREAKING CHANGE 才产生新版本。
+          # 分支上若只有 docs、chore、ci、test 等提交，new_tag 为空，
+          # 本次运行不发版——下面每一步都据此跳过。
+          default_bump: false
+          # 这些分支产出正式版本号；其他分支只会得到预发布号。
+          release_branches: release,release/.*,hotfix,hotfix/.*
           dry_run: true
 
-      - name: Sync version into manifest and MCP server
+      - name: 无可发布变更
+        if: steps.tag.outputs.new_tag == ''
+        run: |
+          echo "自上一个 tag 以来没有 feat / fix / BREAKING CHANGE 提交，跳过发版。"
+          echo "（default_bump: false —— docs、chore、ci、test 等提交不会单独触发版本递增）"
+
+      - name: Sync version into manifest, MCP server and landing page
         if: steps.tag.outputs.new_tag != ''
         run: |
           set -euo pipefail
@@ -85,7 +98,6 @@ jobs:
             # set_version.py 新增一处版本位点时，这里不需要跟着改。
             # 曾因写死路径漏掉 docs/index.html，发出的 tag 里徽章仍是旧版本。
             git add -u
-            # [skip ci] 避免这次回写又触发一轮发版
             git commit -m "chore(release): 同步版本号到 ${{ steps.tag.outputs.new_tag }} [skip ci]"
           fi
           # 确认没有任何改动被漏在工作区——漏掉就意味着 tag 会指向版本号不完整的内容
@@ -95,17 +107,18 @@ jobs:
             exit 1
           fi
 
-      # 顺序即回滚策略：tag 先只建在本地，main 推成功后才推 tag、再建 Release。
-      # 因此推 main 失败时，尚未发布任何东西，修好原因重跑即可。
+      # 顺序即回滚策略：tag 先只建在本地，发布分支推成功后才推 tag、再建 Release。
+      # 因此推分支失败时尚未发布任何东西，修好原因重跑即可。
       - name: Tag and push
         if: steps.tag.outputs.new_tag != ''
         run: |
           set -euo pipefail
+          BRANCH="${GITHUB_REF#refs/heads/}"
           git tag -a "${{ steps.tag.outputs.new_tag }}" -m "${{ steps.tag.outputs.new_tag }}"
-          if ! git push origin HEAD:main; then
-            echo "::error::推送 main 失败，尚未创建远端 tag 或 Release，可安全重跑。"
-            echo "::error::常见原因：分支保护禁止 github-actions[bot] 推送（需为其放行，"
-            echo "::error::或把版本回写改为开 PR）；或本次运行期间 main 已被他人推进。"
+          if ! git push origin "HEAD:${BRANCH}"; then
+            echo "::error::推送 ${BRANCH} 失败，尚未创建远端 tag 或 Release，可安全重跑。"
+            echo "::error::常见原因：分支保护禁止 github-actions[bot] 推送（需为其放行），"
+            echo "::error::或本次运行期间该分支已被他人推进。"
             exit 1
           fi
           git push origin "${{ steps.tag.outputs.new_tag }}"
@@ -117,3 +130,33 @@ jobs:
           tag_name: ${{ steps.tag.outputs.new_tag }}
           name: ${{ steps.tag.outputs.new_tag }}
           body: ${{ steps.tag.outputs.changelog }}
+
+      # 让 main 具备发版后的内容。放在发布之后：Release 是主产物，即使这一步
+      # 失败，版本也已经出去了，main 只需按下面的提示手工同步一次。
+      #
+      # --only-if-newer：hotfix 常从旧 tag 切出，此时 main 可能已经声明了更高
+      # 的版本号，直接回写会造成降级。
+      #
+      # 注意这里只同步版本号，不做分支合并。hotfix 分支上的代码修复需要人工
+      # 合回 main —— 自动合并可能冲突，不适合无人值守。
+      - name: Propagate version to main
+        if: steps.tag.outputs.new_tag != ''
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B main origin/main
+          python .github/scripts/set_version.py "${{ steps.tag.outputs.new_version }}" --only-if-newer
+          if git diff --quiet; then
+            echo "main 无需变更（已声明同版本或更新的版本）"
+            exit 0
+          fi
+          git add -u
+          git commit -m "chore(release): 同步版本号到 ${{ steps.tag.outputs.new_tag }} [skip ci]"
+          if ! git push origin main; then
+            echo "::error::Release ${{ steps.tag.outputs.new_tag }} 已发布，但版本号未能同步到 main。"
+            echo "::error::请在本地执行："
+            echo "::error::  git checkout main && git pull"
+            echo "::error::  python .github/scripts/set_version.py ${{ steps.tag.outputs.new_version }}"
+            echo "::error::  git commit -am 'chore(release): 同步版本号到 ${{ steps.tag.outputs.new_tag }}' && git push"
+            exit 1
+          fi

@@ -630,6 +630,29 @@ export QA01_DB_PASSWORD='...'
 - `UPDATE`/`DELETE` 必须有 `WHERE`，且 SQL 必须有精确业务键或主键条件
 - 执行后再跑 `SELECT` 验证
 
+## 发版
+
+发版只发生在 `release` 与 `hotfix` 分支上，推 `main` 不会发版。
+
+```bash
+git switch -c release        # 或 release/1.2.0、hotfix、hotfix/1.1.2
+git push -u origin release
+```
+
+推送后自动执行：跑测试 → 按 Conventional Commits 计算版本 → 把版本号写入
+`plugin.json`、`SERVER_VERSION` 与主页徽章并提交 → 在该提交上打 tag → 发布
+GitHub Release → 把版本号同步回 `main`。
+
+几点需要知道：
+
+- **只有 `feat`、`fix` 和 `BREAKING CHANGE` 会产生新版本**（`default_bump: false`）。
+  分支上若只有 `docs`、`chore`、`ci`、`test` 提交，本次运行不发版，日志会写明原因。
+- tag 指向的是**已经写入新版本号**的那个提交，不是它的父提交。
+- 同步回 `main` 时不会降级版本号：`hotfix` 常从旧 tag 切出，此时若 `main` 已声明
+  更高版本，这一步会跳过。
+- **只同步版本号，不做分支合并。** `hotfix` 分支上的代码修复需要人工合回 `main`。
+- 发版会在 `main` 上产生一个回写提交，本地下次推送前先 `git pull`。
+
 ## 验证
 
 基础脚本校验：

@@ -62,9 +62,29 @@ def set_page_version(root, version):
     return path
 
 
-def set_version(root, version):
+def current_version(root):
+    """Version the tree currently declares, or None if it cannot be read."""
+    path = root / ".codex-plugin" / "plugin.json"
+    try:
+        declared = json.loads(path.read_text(encoding="utf-8")).get("version", "")
+    except (OSError, ValueError):
+        return None
+    return declared if VERSION_PATTERN.match(str(declared)) else None
+
+
+def as_tuple(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def set_version(root, version, only_if_newer=False):
     if not VERSION_PATTERN.match(version):
         raise SystemExit(f"not a major.minor.patch version: {version!r}")
+    if only_if_newer:
+        current = current_version(root)
+        # A hotfix is usually branched from an older tag, so propagating its
+        # version to a main that has already moved on would be a downgrade.
+        if current and as_tuple(version) <= as_tuple(current):
+            return []
     return [
         set_plugin_version(root, version),
         set_server_version(root, version),
@@ -81,9 +101,19 @@ def main(argv=None):
         default=DEFAULT_ROOT,
         help="Repository root. Overridable so the behaviour can be tested on a copy.",
     )
+    parser.add_argument(
+        "--only-if-newer",
+        action="store_true",
+        help="Do nothing when the tree already declares this version or a newer one. "
+             "Used when propagating a hotfix version onto a branch that may be ahead.",
+    )
     args = parser.parse_args(argv)
 
-    for path in set_version(args.root, args.version):
+    written = set_version(args.root, args.version, only_if_newer=args.only_if_newer)
+    if not written:
+        print(f"已声明 {current_version(args.root)}，不回退到 {args.version}")
+        return 0
+    for path in written:
         print(f"{path.relative_to(args.root)} -> {args.version}")
     return 0
 

@@ -131,6 +131,46 @@ class SetVersionTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.mod.set_version(self.root, "1.2.3")
 
+    def test_only_if_newer_refuses_to_downgrade(self):
+        """A hotfix is usually branched from an older tag, so propagating its
+        version onto a main that has moved on would walk the version backwards."""
+        self.mod.set_version(self.root, "2.5.0")
+        before = self.manifest().read_bytes()
+
+        written = self.mod.set_version(self.root, "1.1.2", only_if_newer=True)
+
+        self.assertEqual(written, [])
+        self.assertEqual(self.manifest().read_bytes(), before)
+        self.assertEqual(declared_page_version(self.page()), "2.5.0")
+
+    def test_only_if_newer_refuses_the_same_version(self):
+        self.mod.set_version(self.root, "2.5.0")
+
+        self.assertEqual(self.mod.set_version(self.root, "2.5.0", only_if_newer=True), [])
+
+    def test_only_if_newer_writes_a_higher_version(self):
+        self.mod.set_version(self.root, "1.1.1")
+
+        written = self.mod.set_version(self.root, "1.2.0", only_if_newer=True)
+
+        self.assertEqual(len(written), 3)
+        self.assertEqual(declared_page_version(self.page()), "1.2.0")
+
+    def test_only_if_newer_compares_numerically_not_lexically(self):
+        # "1.10.0" < "1.9.0" as strings, but 1.10.0 is the newer release.
+        self.mod.set_version(self.root, "1.9.0")
+
+        self.assertEqual(len(self.mod.set_version(self.root, "1.10.0", only_if_newer=True)), 3)
+        self.assertEqual(self.mod.set_version(self.root, "1.9.0", only_if_newer=True), [])
+
+    def test_plain_set_version_still_overwrites_downwards(self):
+        # The release branch itself must always get the computed version, so the
+        # tag carries it; only the propagation step guards against downgrades.
+        self.mod.set_version(self.root, "2.5.0")
+
+        self.assertEqual(len(self.mod.set_version(self.root, "1.0.0")), 3)
+        self.assertEqual(declared_page_version(self.page()), "1.0.0")
+
     def test_fails_loudly_when_a_version_site_is_duplicated(self):
         server = self.server()
         text = server.read_text(encoding="utf-8")

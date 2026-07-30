@@ -1,10 +1,10 @@
 name: CI
 
+# main 也要跑：release.yml 现在只在 release / hotfix 分支触发，
+# 若这里继续忽略 main，直接推到 main 的提交将完全没有 CI 覆盖。
 on:
   pull_request:
   push:
-    branches-ignore:
-      - main
 
 # 同一分支/PR 只保留最新一次运行
 concurrency:
