@@ -81,9 +81,18 @@ jobs:
           if git diff --quiet; then
             echo "版本号已是最新，无需提交"
           else
-            git add .codex-plugin/plugin.json skills/database-cli/scripts/database-mcp
+            # 用 -u 暂存全部被改动的已跟踪文件，而不是写死路径：
+            # set_version.py 新增一处版本位点时，这里不需要跟着改。
+            # 曾因写死路径漏掉 docs/index.html，发出的 tag 里徽章仍是旧版本。
+            git add -u
             # [skip ci] 避免这次回写又触发一轮发版
             git commit -m "chore(release): 同步版本号到 ${{ steps.tag.outputs.new_tag }} [skip ci]"
+          fi
+          # 确认没有任何改动被漏在工作区——漏掉就意味着 tag 会指向版本号不完整的内容
+          if ! git diff --quiet; then
+            echo "::error::set_version.py 的改动未被完整提交："
+            git --no-pager diff --name-only
+            exit 1
           fi
 
       # 顺序即回滚策略：tag 先只建在本地，main 推成功后才推 tag、再建 Release。
