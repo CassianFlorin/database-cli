@@ -11,6 +11,19 @@ from _common import parse_database_url  # noqa: E402  (path set above)
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+LEGACY_CONFIG = SKILL_ROOT / "connections.local.json"
+USER_CONFIG = Path.home() / ".config" / "database-cli" / "connections.json"
+
+
+def default_output_path():
+    """Where to write when the caller passed no --config/--output.
+
+    Prefers `~/.config/database-cli/connections.json` so plaintext passwords stay
+    outside the checked out repository. An existing in-repo config keeps winning,
+    because `_common.config_paths` reads it ahead of `~/.config`: writing
+    elsewhere while that file survives would leave edits with no visible effect.
+    """
+    return LEGACY_CONFIG if LEGACY_CONFIG.exists() else USER_CONFIG
 
 
 def prompt(label, default="", secret=False, required=False):
@@ -154,8 +167,12 @@ def parse_args():
         "--output",
         "--config",
         dest="output",
-        default=str(SKILL_ROOT / "connections.local.json"),
-        help="Config file to write. --config is accepted as an alias for consistency with db-query.",
+        default=None,
+        help=(
+            "Config file to write. --config is accepted as an alias for consistency with db-query. "
+            "Defaults to ~/.config/database-cli/connections.json, or to an existing in-repo "
+            "connections.local.json when one is already present."
+        ),
     )
     parser.add_argument("--env", help="Environment name, e.g. qa01 or prod.")
     parser.add_argument("--url", help="Database URL or host/domain supplied by the user or Agent.")
@@ -184,7 +201,20 @@ def parse_args():
 
 def main():
     args = parse_args()
-    output = Path(args.output).expanduser()
+    if args.output:
+        output = Path(args.output).expanduser()
+    else:
+        output = default_output_path()
+        if output == LEGACY_CONFIG:
+            print(
+                f"init-config: writing to {output}, which is inside the repository working tree. "
+                f"It is gitignored, but a forced `git add` or an upstream ignore-rule change can still "
+                f"publish plaintext passwords. To move it out (move, do not copy — the in-repo file "
+                f"takes read precedence over ~/.config):\n"
+                f"  mkdir -p {USER_CONFIG.parent} && chmod 700 {USER_CONFIG.parent}\n"
+                f"  mv {output} {USER_CONFIG}",
+                file=sys.stderr,
+            )
 
     try:
         config = load_existing(output)
@@ -196,7 +226,12 @@ def main():
         config["environments"][env_name] = env
         imported = [env_name]
 
+        # 0700 rather than the default 0755: the directory holds plaintext passwords.
+        # Only applied on creation, so an existing directory keeps the user's own mode.
+        created_parent = not output.parent.exists()
         output.parent.mkdir(parents=True, exist_ok=True)
+        if created_parent:
+            os.chmod(output.parent, 0o700)
         with output.open("w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2, ensure_ascii=False)
             handle.write("\n")

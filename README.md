@@ -370,10 +370,17 @@ scripts/init-config
 默认生成的配置路径是：
 
 ```text
-skills/database-cli/connections.local.json
+~/.config/database-cli/connections.json
 ```
 
-文件权限是 `0600`，并且已被 `.gitignore` 忽略。
+目录权限 `0700`，文件权限 `0600`。放在仓库外是为了避免明文密码留在工作区里——`.gitignore` 只是最后一道防线，一次 `git add -f` 或上游调整忽略规则就可能把凭据带进版本库。
+
+如果 `skills/database-cli/connections.local.json` 已经存在，则继续写入该文件并在 stderr 提示迁移。因为配置查找**在第一个存在的文件处停止**，且库内路径优先级高于 `~/.config`，此时改写新位置不会生效。迁移时要**移动而不是复制**：
+
+```bash
+mkdir -p ~/.config/database-cli && chmod 700 ~/.config/database-cli
+mv skills/database-cli/connections.local.json ~/.config/database-cli/connections.json
+```
 
 配置文件专用的非交互式示例：
 
@@ -583,7 +590,7 @@ export QA01_DB_PASSWORD='...'
 }
 ```
 
-如果直接把 `password` 写进 `connections.local.json`，必须只保存在本地。Wrapper 会通过 `sq add --password` 的 stdin 传递密码，不会把密码放进命令行 DSN。
+如果直接把 `password` 写进配置文件，必须只保存在本地，并优先放在仓库外的 `~/.config/database-cli/connections.json`。Wrapper 会通过 `sq add --password` 的 stdin 传递密码，不会把密码放进命令行 DSN。
 
 ## 支持的 Driver
 

@@ -6,8 +6,38 @@ The wrapper reads config from the first existing path:
 
 1. `--config <path>`
 2. `$DATABASE_CLI_CONFIG`
-3. `./connections.local.json`
-4. `~/.config/database-cli/connections.json`
+3. `<skill root>/connections.local.json`
+4. `./connections.local.json`
+5. `~/.config/database-cli/connections.json`
+
+`--config` and `$DATABASE_CLI_CONFIG` are exclusive rather than first-in-list:
+when either is set it becomes the only candidate, and pointing it at a missing
+file is an error instead of a fall-through to the paths below.
+
+Among the remaining paths, precedence stops at the first file that exists, so a leftover
+`<skill root>/connections.local.json` silently wins over every later path. When
+relocating config, **move the old file rather than copying it** — otherwise the
+in-repo copy keeps serving stale credentials and edits to the new file appear to
+do nothing.
+
+## Where To Keep It
+
+`~/.config/database-cli/connections.json` is the default. It lives outside the
+checked out repository, so no `.gitignore` rule, `git add -f`, or upstream change
+to the ignore list can commit real credentials.
+
+`<skill root>/connections.local.json` is the historical default and remains
+supported — it is covered by `**/connections.local.json` in `.gitignore` — but it
+puts plaintext passwords inside the working tree, one forced `git add` away from
+being published. An existing one still takes precedence, so setups created before
+this change keep working untouched.
+
+To migrate such a setup, move the file rather than copying it:
+
+```bash
+mkdir -p ~/.config/database-cli && chmod 700 ~/.config/database-cli
+mv skills/database-cli/connections.local.json ~/.config/database-cli/connections.json
+```
 
 ## Recommended Config
 
@@ -36,7 +66,7 @@ If you only need to create or update config and do not need the `sq` check, run 
 scripts/init-config
 ```
 
-The initializer writes `skills/database-cli/connections.local.json` with file mode `0600` when run through the plugin root wrapper. If run from inside `skills/database-cli`, it writes that same local config file. `--config` is accepted as an alias for `--output`.
+Without `--config`, the initializer writes `~/.config/database-cli/connections.json`, creating the directory `0700` and the file `0600`. If `skills/database-cli/connections.local.json` already exists it keeps that file instead and prints a migration hint on stderr — that path is read first, so writing elsewhere while it survives would leave later edits with no visible effect. `--config` is accepted as an alias for `--output`.
 
 The initializer can accept either split fields or a user-provided database URL. Explicit flags override values parsed from the URL:
 

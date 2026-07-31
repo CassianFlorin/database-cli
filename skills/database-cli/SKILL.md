@@ -111,7 +111,7 @@ Use the JSON `next_actions` as the default instruction path. If `sq` is missing,
 brew install sq
 ```
 
-If no environments are configured, either ask for the connection facts needed by `scripts/install`, or use ad-hoc connection flags when the user already gave enough details for a one-off query. The minimum useful facts are database URL or host/domain, username, and password or `password_env`. The default local config path is `skills/database-cli/connections.local.json` when using the plugin root wrapper. Do not invent hosts, credentials, or environment mappings.
+If no environments are configured, either ask for the connection facts needed by `scripts/install`, or use ad-hoc connection flags when the user already gave enough details for a one-off query. The minimum useful facts are database URL or host/domain, username, and password or `password_env`. The default config path is `~/.config/database-cli/connections.json`, outside the repository; an existing `skills/database-cli/connections.local.json` is still used and still takes read precedence, so relocating one means moving the file, not copying it. Do not invent hosts, credentials, or environment mappings.
 
 If the user is installing or adding a connection through an Agent and the connection details are missing, ask the user for the database URL or host, username, and either password or password environment variable. Do not guess connection URLs, usernames, passwords, or access scope.
 

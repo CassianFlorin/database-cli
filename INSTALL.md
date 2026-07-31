@@ -52,7 +52,14 @@ scripts/install \
   --non-interactive
 ```
 
-如需写到指定配置文件，加 `--config /path/to/connections.local.json`。如需覆盖已有环境，加 `--force`。
+默认写入 `~/.config/database-cli/connections.json`（目录 `0700`，文件 `0600`），在仓库外，不会被误提交。如需指定其他路径，加 `--config /path/to/connections.json`。如需覆盖已有环境，加 `--force`。
+
+如果 `skills/database-cli/connections.local.json` 已存在（旧版本装的），则继续写该文件并在 stderr 提示迁移。该路径读取优先级高于 `~/.config`，所以迁移时必须移动而不是复制：
+
+```bash
+mkdir -p ~/.config/database-cli && chmod 700 ~/.config/database-cli
+mv skills/database-cli/connections.local.json ~/.config/database-cli/connections.json
+```
 
 4. 如果提示缺少 `sq`，先询问用户是否允许用 Homebrew 安装。
 
